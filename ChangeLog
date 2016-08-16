@@ -1,1 +1,636 @@
-See git history in https://github.com/schoebel/mars/commits/master
+IMPORTANT: the historic distinction between MARS Light and the future
+MARS Full has been dropped. Now all versions are simply called "mars".
+
+Old tagnames light* will remain valid, but newer names will follow the
+convention s/light/mars/g (this means that the old version number counting
+will be continued, only the "light" is substituted).
+
+
+Meaning of stable tagnames
+--------------------------
+
+Example: mars0.1stable01:
+             0             = version of on-disk data structures
+                            (only incremented when downgrades are impossible)
+                            (not incremented on backwards-compatible upgrades)
+               1           = version of feature set
+                stable     = feature set is frozen during this series
+                      01   = bugfix revision
+
+Example: mars0.2beta2.3:
+			   The general idea is as before.
+			   "beta" means that new features are roughly tested
+			   in the lab, but not in production, so there may be
+	                   some bugs. New features may be added during
+			   the beta phase.
+
+Example: mars0.3alpha*:
+			  Never use this for production. Only for historic
+			  code inspection.
+
+Release Conventions / Branches / Tagnames
+-----------------------------------------
+
+	mars0.1 series (stable):
+		 - Asynchronous replication.
+		   Currently operational at more than 1700 servers at
+		   1&1, more than 9,000,000 operating hours (Mar 2016)
+		 - Unstable tagnames: light0.1beta%d.%d (obsolete)
+		 - Stable branch: mars0.1.y
+		 - Stable tagnames: mars0.1stable%02d
+
+	mars0.2 series (currently in beta stage):
+		   Mostly for internal needs of 1&1 (but not limited to that).
+		 - Getting rid of the kernel prepatch! MARS may be built
+		   as an external kernel module for any supported
+		   kernel version. First prototype is only tested for
+		   unaltered 3.2.x vanilla kernel, but compatibility to
+		   further vanilla kernel versions (maybe even
+		   Redhat-specific ones) will follow during the course of
+		   the MARS mars0.2 stable series. The problem is not
+		   compatibility as such, but _testing_ that it really
+		   works. These tests need a lot of time.
+		   => further arguments for getting to kernel upstream ASAP.
+		 - Improved network throughput by parallel TCP connections
+		   (in particular under packet loss).
+		   Also called "socket bundling".
+		   First benchmarks show an impressive speedup over
+		   highly congested long-distance lines.
+		 - Future-proof updates in the network protocol:
+		   Mixed operation of 32/64bit and/or {big,low}endian
+		 - Support for multi-homed network interfaces.
+		 - Transparent data compression over low bandwidth lines.
+		   Consumes a lot of CPU, therefore only recommended for
+		   low write loads or for desperate network situations.
+		 - Remote device: bypassing iSCSI. In essence,
+		   /dev/mars/mydata can appear at any other cluster member
+		   which doesn't necessarily need any local disks.
+		 - Various smaller features and improvements.
+		 - Unstable tagnames: mars0.2beta%d.%d (current)
+		 - Stable branch: mars0.2.y (already in use for beta)
+		 - Stable tagnames: mars0.2stable%02d (planned)
+
+	mars0.3 series (planned):
+		   (some might possibly go to 1.0 series instead)
+		 - Improve replication latency.
+		 - New pseudo-synchronous replication modes.
+		   For the internal needs of database folks at 1&1.
+		 - (Maybe) old test suite could be retired, a new
+		   one is at github.com/schoebel/test-suite
+		 - Unstable tagnames: mars0.3beta%d.%d (planned)
+		 - Stable branch: mars0.3.y (planned)
+		 - Stable tagnames: mars0.3stable%02d (planned)
+
+	mars1.0 series (planned):
+		 - Replace symlink tree by transactional status files
+		   (future-proof)
+		   This is required for upstream merging to the kernel.
+		   It has further advantages, such as better scalability.
+		 - Trying to additionally address public needs.
+		 - Potentially for Linux kernel upstream,
+		 - Unstable tagnames: mars1.0beta%d.%d (planned)
+		 - Stable branch: mars1.0.y (planned)
+		 - Stable tagnames: mars1.0stable%02d (planned)
+
+	full* (somewhen in future)
+
+	WIP-* branches are for development and may be rebased onto anything
+	at any time without notice. They will disappear eventually.
+
+	*stable* branches mean that only bug fixes and documentation
+	updates / clarifications will be applied. Updates to the test suite /
+	new test cases potentially disguising bugs, and other minor additions
+	of debugging code / paranoia code which may lead to discovery
+	of bugs are also possible. Error messages / warnings and their
+	error class may	also be changed.
+	NO NEW FEATURES, not even minor ones, except when absolutely
+	necessary for a bugfix, or for an important usability improvement
+	(such as clearer display of errors, hints for resolving them, etc).
+
+-----------------------------------
+Changelog for series 0.2:
+
+(you need to checkout branch mars0.2.y to see any details)
+
+-----------------------------------
+Changelog for series 0.1:
+
+mars0.1stable29
+--------
+	* Minor fix: on very fast hardware and networks, sync could take
+	  a while for terminating.
+	* Minor fix: external module build.
+	* Major usability improvement: new expert commands marsadm
+	  lowlevel-ls-host-ips, lowlevel-set-host-ip, lowlevel-delete-host.
+	  Necessary for moves between networks, dedicated replication IPs,
+	  etc.
+	* Minor doc update.
+
+mars0.1stable28
+--------
+	* Doc: describe new naming conventions.
+	  MARS Light is now simply called MARS.
+	  No distinction between "Light" and the future "Full" anymore.
+	  Please note that the git branches light0.1.y and light0.2.y have
+	  been renamed to mars0.1.y and mars0.2.y respectively.
+	* Minor sourcecode cleanup: s/light//g or s/light/main/g
+	  where appropriate.
+	  No other changes in the sourcecode, deliberately.
+	  In case anyone encounters any build problems compiling MARS,
+	  this release is separated just for the sake of build testing,
+	  or Debian packaging testing, etc.
+	* Doc: minor clarifications.
+
+mars0.1stable27
+light0.1stable27
+--------
+	* Critical fix: typo in sync progress comparison code could lead
+	  to data version mismatches during sync when alternating with
+	  replay. Only observed at a certain new hardware class, and only
+	  while testing with an extremely high load (9 loaded resources
+	  in parallel to 9 concurrent syncs). As a workaround,
+	  echo 0 > /proc/sys/mars/sync_flip_interval_sec can be used.
+	  Nevertheless, update is highly recommended!
+	* Major fix: slow memory leak (regression from light0.1stable26).
+	  Only when starting the transaction logger (i.e. primary is typically
+	  not affected). But don't let run it for a longer time.
+	  Monitoring is possible via /proc/slabinfo (size-64 or siblings).
+	* Minor fix: join-cluster did not check for duplicate IP addresses.
+	* Minor fixes: some unnecessary annoying error messages.
+	* Docu: new slides from GUUG 2016 in Köln.
+
+light0.1stable26
+--------
+	* Minor fixes: some primitive macros were reporting misleading or
+	  even wrong values at split brain, or during/after emergency mode.
+	  Some high-level macros as well as try_to_avoid_split_brain
+	  should work better / more reliable now.
+	* Minor fix: potential deadlock after crash reboot, or after
+	  defective /mars filesystem. Never observed in practice.
+	* Minor safeguard: unnecessary split brain could emerge at
+	  secondaries under extremely rare and strange conditions.
+	  Unsure whether it ever occurred in practice.
+	* Minor usability improvement: show incorrect permissions on /mars.
+	  Some other sysadmin tools like Puppet seem to have their own
+	  default notion of "secure permissions" ;)
+	* Minor doc reorg, better chapter structure.
+
+light0.1stable25
+--------
+	* Major fix: in rare cases "marsadm primary" (without --force)
+	  could go into an endless loop, even if --timeout= was specified.
+	* Minor fix: in rare cases of hanging or defective IO, crashes
+	  of the primary could replicate versionlinks to the secondary,
+	  but after reboot they were missing at the primary because of
+	  of hanging IO or other IO / RAID controller problems.
+	  Now using sync_filesystem() for either ensuring actuality,
+	  or for letting the mars_light main control thread hang
+	  (which will hopefully be noticed soon by monitoring).
+	* Minor fix: join-cluster uses rsync, which could abort due to
+	  vanished filesystem objects while the primary is actively running.
+	  Now it should tolerate such "errors".
+	* Minor fixes / additions at primitive macros.
+	* Tiny doc update.
+
+light0.1stable24
+--------
+	* Skip this release due to a regression.
+
+light0.1stable23
+--------
+	* Minor fix: the new replay-code error message was forgotten
+	  to reset at secondaries. Now the annoying old error message
+	  disappears after the next successful logrotate.
+	* Minor fixes of internal marsadm code (not in use until now).
+	* Minor doc update.
+
+light0.1stable22
+--------
+	* Critical fix for non-storage servers: the /mars directory
+	  was readable by ordinary non-root users, opening a potential
+	  security hole. Originally MARS was designed for standalone
+	  storage servers solely, but now it is increasingly deployed to
+	  machines where ordinary users can log in.
+	  Update recommended, but only urgent for potentially affected
+	  installations.
+	* Minor fix: when a logfile was damaged (observed at defective
+	  hardware), this was often (but not always) detected by the
+	  md5 data checksums in the transaction logfiles. So far so good.
+	  The replay / recovery process stopped for a very good reason.
+	  But it was not easily possible to _force_ any of the resource
+	  members into primary role when the defect was already present at
+	  the _primary_ (which happend once during 7 millions of operating
+	  hours, and at a primary site which proved defective afterwards),
+	  and the defect had been replicated to all secondaries.
+	  As a workaround, the resource could be destroyed via leave-resource
+	  everywhere, and re-surrected from scratch. Clumsy.
+	  Now an md5 checksum error in the middle of a logfile is
+	  treated similarly to an EOF. "primary --force" will succeed now,
+	  without applying the defective data (as before).
+	  Split brain will result for sure in such a case.
+	* Minor improvement: md5 logfile checksum errors are now displayed
+	  directly in the diskstate macro (and therefore also at plain
+	  "view").
+	* Minor improvement: when "marsadm view all" told you "InConsistent"
+	  as the disk state, this was _formally correct_ because it related
+	  to the state of the _disk_, not to the state of the replication.
+	  The former message could appear regularly during ordinary
+	  out-of-order writeback at the primary side, without violating
+	  the consistency of /dev/mars/mydata.
+	  However, many people were confused and alarmed by the irritating
+	  message.
+	  Now a better wording is used: "WriteBack" and "Recovery" describes
+	  more intuitively what is really happening :)
+	* Minor doc improvements.
+
+light0.1stable21
+--------
+	* Hint: now MARS has been rolled out to more than 1600 servers,
+	  including some MySQL database servers, and has collected more
+	  than 6 millions of operation hours.
+	* Minor fixes, none of them observed in practice, only found
+	  by testing while working on new features:
+	  - potential read page fault
+	  - potential deadlock
+	  - incorrect remote symlink update under untypical circumstances
+
+light0.1stable20
+--------
+	* Hint: MARS is now running on more than 850 storage servers,
+	  and has collected more than 4.5 millions of operation hours.
+	  There were no new incidents with customer impact since the last
+	  major bugfix (more than 3 millions of operation hours since then).
+	  It is difficult to deduce a reliability from that, but it appears
+	  that at least 99.999%, if not 99.9999% are now real for the
+	  MARS component as a standalone component (not to be confused with
+	  overall system reliability). Our storage hardware is clearly much
+	  less reliable. MARS does compensate these defects all the time.
+
+	* Minor fix: memory leak in networking code, does not occur
+	  at light0.1 operations (but maybe future versions of MARS).
+	* Doc: add presentation slides from Froscon2015.
+
+light0.1stable19
+--------
+	* Minor safeguard: warn when somebody tries leave-resource --host=
+	  for a damaged host, and later the dead host resurrects in an
+	  unreasonable way.
+	* Doc update: describe use cases for DRBD vs MARS more clearly.
+	* Minor spelling fixes.
+
+light0.1stable18
+--------
+	* Minor safeguard: prevent join-resource when previous log-purge-all
+	  has been forgotten. Prevent create-resource also when previous
+	  delete-resource has been forgotten. Anyway, this happens only in
+	  very exotic repair scenarios after very heavy failures.
+	* Doc updates: simplify descriptions of split-brain resolution and
+	  emergency mode resolution. Nowadays 'invalidate' will do everything
+	  in all tested cases; the more complex alternative methods have
+	  been moved to the appendix.
+
+light0.1stable17
+--------
+	* Minor fix: stacktrace / oops in aio callback path due to a
+	  subtle race, observed once during 2.5 millions of operation hours.
+	  In the observed case, the secondary was hanging, without
+	  customer impact. However, the error class could potentially
+	  occur also at the primary side. Probably the bug was triggered
+	  by a hardware problem from the RAID controller.
+
+light0.1stable16
+--------
+	* Minor fix: sync could take a long time to complete under high
+	  application load, similarly to a live-lock.
+	* Some smaller minor fixes for annoying messages.
+	* Contrib: added configurable Nagios check.
+	* Contrib: added some example scripts which could be used by
+	  clustermanagers etc.
+	* Doc: important new section on pitfalls when using existing
+	  clustermanagers UNMODIFIED for long distance replication.
+	  PLEASE READ!
+
+light0.1stable15
+--------
+	* NOTICE: MARS succeeded baptism on fire at 04/22/2015 when a whole
+	  co-location had a partial power blackout, followed by breakdown
+	  of air conditioning, followed by mass hardware defects due to
+	  overheating. MARS showed exactly 0 errors when (emergency)
+	  switching to another datacenter was started in masses.
+	* Major fix of race in transaction logger: the primary could hang
+	  when using very fast hardware, typically after ~24000 operation
+	  hours. The problem was noticed 6 times during a grand total of
+	  more than 1,000,000 operation hours on a mixed hardware park,
+	  showing up only on specific hardware classes. Together with 3
+	  other incidents during early beta phase which also had customer
+	  impact, this means that we have reached a reliability of about
+				  ===> 99.999%
+	  After this fix, the reliability should grow even higher.
+	  A workaround for this bug exists:
+	  # echo 2 > /proc/sys/mars/logger_completion_semantics
+	  Update is only mandatory when you cannot use the workaround.
+	* Minor improvement in marsadm: re-allow --force combined with "all".
+	  This is highly appreciated for speeding up operations / handling
+	  during emergency datacenter switchover.
+	* Various smaller improvements.
+	* Contrib (unsupported): example rollout script for mass rollout.
+
+light0.1stable14
+--------
+	* Minor safeguard: modprobe mars will refuse to start when the
+	  cluster UUID is missing.
+	* Minor fix: external race in marsadm resize, only relevant
+	  for scripting.
+	* Minor fix: potential race on plugged IO requests.
+	* Clarify output of marsadm view. Many systematical improvements
+	  and hints.
+	* Add some unevitable macros for scripting / automation.
+	* Various tiny improvements.
+
+light0.1stable13
+--------
+	* Critical safeguard for accidental join-cluster with wrong argument:
+	  make UUID mandatory, disallow completely unrelated hosts to
+	  communicate symlink tree updates when their UUIDs mismatch.
+	* Minor fix: leave-resource --host=other did not work when disks
+	  were named differently throughout the cluster.
+	* Minor fix: detach --host=other --force (which is needed as a
+	  precondition) did not work.
+	* Various minor fixes and clarifications. "marsadm view all"
+	  now reports the communication status in the cluster.
+
+light0.1stable12
+--------
+	* Critical (but usually not extremely relevant) fix:
+	  When emergency mode occurs just during a sync, the target could
+	  remain inconsistent without notice. Now noticed.
+	  You always could/should manually invalidate whenever an
+	  emergency mode appeared.
+	  Now this is automatically fixed by restarting any sync from
+	  scratch (if one was actually running before; otherwise consistency
+	  was never violated).
+	* Major documentation update / corrections.
+	* Major (but less relevant) fix: leave-cluster did not really work.
+	* Minor fix (regression): rmmod could hang when sync was running.
+	* Various minor fixes and clarifications.
+
+light0.1stable11
+--------
+	* Major documentation update. mars-manual.pdf increased from
+	  66 to 80 pages. Please read! You probably should know this.
+	* Minor fixes: better cleanup on invalidate / leave-resource.
+	* Minor clarifications: more precise EIO error codes, more verbose
+	  error reporting via "marsadm cat".
+
+light0.1stable10
+--------
+	* Major fixes of internal network protocol errors, leading to
+	  internal shutdown of sockets, which were transparently re-opened.
+	  It could affect network performance. Not sure whether
+	  stability was also affected (probably under extremely high load);
+	  for better safety you should upgrade.
+	* Major fix from Manuel Lausch: regex parsing sometimes went
+	  completely wrong when hostnames followed a similar name scheme
+	  than internal symlinks.
+	* Major, only relevant for k>2 replicas: fix wrong internal sharing
+	  of data structures resulting from parallel data connections.
+	* Minor fix: race in fake-sync.
+	* Minor fix: race in invalidate.
+	* Minor, only for k>2 replicas: fix direct primary handover when
+	  some non-involved hosts are currently unreachable.
+	* Minor: improve becoming primary during split brain.
+	* Minor: improve becoming primary when emergency mode starts.
+	* Minor: silence some annoying stderr messages.
+	* Several internal minor fixes and clarifications.
+
+light0.1stable09
+--------
+	* Major fix of scarce race (potentially critical): the bio response
+	  thread could terminate too early, leading to a premature dealloc
+	  of kernel memory. This has only been observed on slow virtual
+	  machines with slow virtual devices, and very high load on k=4
+	  replicas. This could potentially affect the stability of the system.
+	  Although not observed at production machines at 1&1, I recommend
+	  updating production machines to this release ASAP.
+	* Major usability fix: incorrect commandline options of marsadm
+	  were just ignored if they appeared after the resource argument.
+	  Misspellings could cause undesired effects. For instance,
+	  "marsadm delete-resource vital --force --MISSPELLhost=banana"
+	  was accidentally destroying the primary during operation (which
+	  is _possible_ when using --force, and this was even a _required_
+	  sort of "STONITH"-like feature -- however from a human point
+	  of view it was intended to destroy _another_ host, so this was
+	  an unexpected behaviour from a sysadmin point of view).
+	* Major workaround: the concept "actual primary" is wrong, because
+	  during split brain there may exist several primaries. Do not
+	  use the macro view-actual-primary any longer. It is deprecated now.
+	  Use view-is-primary instead, on each host you are interested in.
+	* Minor fix: "marsadm invalidate" did not work in some weired
+	  split brain situations / was not equivalent to
+	  "marsadm leave-resource $res; marsadm join-resource $res".
+	  The latter was the old workaround to fix the situation.
+	  Now it shouldn't be necessary anymore.
+	* Minor fix: pause-fetch could take very long to terminate.
+	* Minor fix: marsadm wait-cluster did not wait for all hosts
+	  particiapting in the resource, but only for one of them.
+	  This is only relevant for k>2 replicas.
+	* Minor fix: the rates displayed by "marsadm view" did not drop down
+	  to 0 when no progress was made.
+	* Minor fix: logging to syslog was incomplete.
+	* Minor usability fix: decrease boring speakyness of "log-rotate"
+	  and "log-delete" for cron jobs.
+	* Minor fixes: several internal awkwardnesses, potentially affecting
+	  performance and/or stability in weired situations.
+
+light0.1stable08
+--------
+	 * Minor fix: after emergency mode, a versionlink was forgotten
+	   to create. This could lead to unnecessary reports of split
+	   brain and/or need for additional re-invalidate.
+	 * Minor fix: the predicate 'view-is-consistent' reported 'false'
+	   in some situations on secondaries when all was ok.
+	 * Minor fix: it was impossible to determine the 'is-consistent'
+	   from 'marsadm view' (without -1and1 suffix). Added a new [Cc-]
+	   flag. This is absolutely needed to determine whether the
+	   underlying disks must have the same checksum (provided that
+	   both disks are detached and the network works and fetch+replay
+	   had completed before the detach).
+	 * Updated docs to reflect this.
+	 * Minor fix: 'invalidate' did not work when the resource was not
+	   completely detached. Now it implicitly does a detach before
+	   starting invalidation.
+	 * Minor fix: wait-umount was waiting for umount of _all_ primaries
+	   during split brain. Now it waits only for umount of the local node.
+	   Notice that having multiple primaries in parallel is an
+	   erroneous state anyway.
+	 * Minor fix: leave-cluster did not work without --force.
+
+light0.1stable07
+--------
+	 * Minor fix: re-creation of a completely destroyed resource
+	   did not always work correctly
+
+light0.1stable06
+--------
+	 * Major fix: becoming primary was hanging in scarce situations.
+	 * Minor fix: some split brains were not always detected correctly.
+	 * Minor fix for Redhat openvz kernel builds.
+	 * Several fixes for 1&1 internal Debian builds.
+
+light0.1stable05
+--------
+	 * Major fix: incomplete calls to vfs_readdir()
+	   which could lead to incomplete symlink updates /
+	   replication hangs.
+	 * Minor fix: scarce race on replay EOF.
+	 * Separated kernel from userspace build environment.
+	 * Removed some potentially dangerous Kconfig options
+	   if they would be set to wrong values (robustness against
+	   accidentally producing bad kernel modules).
+	 * Dito: some additional checks against bad main Kconfig options
+	   (mainly for out-of-tree builds).
+	 * Separated contrib code from maintained code.
+	 * Added some pre-patches for newer kernels
+	   (WIP - not yet fully tested at all combinations)
+	 * Minor doc addition: LinuxTag 2014 presentation.
+
+light0.1stable04
+--------
+	 * Quiet annoying error message.
+	 * Minor readability improvements.
+	 * Minor doc updates.
+
+light0.1stable03
+--------
+	 * Major: fix internal aio race (could lead to memory corruption).
+	 * Fix refcounting in trans_logger.
+	 * Some minor fixes in module code.
+	 * Fix 1&1-internal out-of-tree builds.
+	 * Various minor fixes.
+	 * Update monitoring tools / docs (German, contributed by Jörg Mann).
+
+light0.1stable02
+--------
+	 * Fix sorting of internal data structure.
+	 * Fix IO error propagation at replay.
+
+light0.1stable01
+--------
+	 * Fix parallelism of logfile propagation: sometimes a secondary
+	   could get a more recent version than the primary had on stable
+	   storage after its crash, eventually leading to an (annoying)
+	   split brain. Some people might take this as a feature instead
+	   of a bug, but now the logfile transfer starts only after the
+	   primary _knows_ that the data is successfully committed to
+	   stable storage.
+	 * Fix memory leaks in error path.
+	 * Fix error propagation between client and server.
+	 * Make string allocation fully dynamic (remove limitation).
+	 * Fix some annoying messages.
+	 * Fix usage output of marsadm.
+	 * Userspace: contributed bugfix for Debian udev rules by Jörg Mann.
+	 * Improved debugging (only for testing).
+
+light0.1beta0.18 (feature release)
+--------
+	 * New commands marsadm view-$macroname
+	 * New customizable macro processor
+	 * New err/warn/inf reporting via symlinks
+	 * Per-resource emergency mode
+	 * Allow limiting the sync parallelism
+	 * New flood-protected syslogging
+	 * Some smaller improvements
+	 * Update docs
+	 * Update test suite
+
+light0.1beta0.17
+--------
+	 * Major bugfix: race in logfile switchover could sometimes
+	   lead to the wrong logfile (extremely rare to hit, but
+	   potentially harmful).
+	 * Disallow primary switching when some secondaries are
+	   syncing.
+	 * Fix logfile fetch from multiple peers.
+	 * Fix computation of transitive closure (affected
+	   log-purge-all, split brain detection, and many others).
+	 * Fix incorrect emergency mode detection.
+	 * Primaries no longer fetch logfiles (unnecessarily, only
+	   makes a difference at concurrent split brain operations).
+	 * Detached resources no longer fetch logfiles (unexpectedly).
+	 * Myriads of smaller fixes.
+	
+light0.1beta0.16
+--------
+	
+	 * Critical bugfix: "marsadm primary --force" was assumed to be given
+	   by sysadmins only in case of emergency, when the network is down.
+	   When given in non-emergency cases where the old primary continues
+	   to run (/dev/mars/* being actively used and written), the
+	   old primary could suddendly do a "logrotate" to the
+	   new split-brain logfile produced by the new (second) primary.
+	   Now two primaries should be able to run concurrently in split-brain
+	   mode without mutually trashing their logfiles.
+	 * primary --force now only works in disconnected mode, in order
+	   to hinder unintended forceful creation of split brain during
+	   normal operation.
+	 * Stop fetching of logfiles behind split brain points (save space
+	   at the target hosts - usually the data will be discarded later).
+	 * Fixed split brain detection in userspace.
+	 * leave-resource now waits for local actions to take place
+	   (remote actions stay asynchronously).
+	 * invalidate / join-resource now work only if a designated primary
+	   exists (otherwise they would not know uniquely from whom
+	   to start initial sync).
+	 * Update docs, clarify scenarios intended <-> emergengy switching.
+	 * Fixed mutual overwrite of deletion symlinks in case of racing
+	   log-deletes spawned in parallel by cron jobs (resilience).
+	 * Fixed races between deletion and re-erection (e.g. fresh
+	   join-resource after leave-resource during network partitions).
+	 * Fixed duration of network timeouts in case the network is down
+	   (replaced non-working TCP_KEEPALIVE by explicit timeouts).
+	 * New option --dry-run which does not really create symlinks.
+	 * New command "delete-resource" (VERY DANGEROUS) for
+	   forcefully destroying a resource, even when it is in use.
+	   Intended only for _emergency_ cases when sysadmins are
+	   desperate. Use only by hand, first run with --dry-run in order
+	   to check what will happen!
+	 * New command "log-purge-all" (potentially DANGEROUS) for
+	   resolving split brain in desperate situations (cleanup of
+	   leftovers). Only use by hand, first run with --dry-run!
+	 * Lots of smaller imprevements / usability / readability etc.
+	 * Update test suite.
+
+light0.1beta0.15
+--------
+	
+	 * Introduce write throttling of bulk writers.
+	 * Update test suite.
+
+light0.1beta0.14
+--------
+	
+	 * Fix logfile transfer in case of "holes" created by
+	   emergency mode.
+	 * Fix "marsadm invalidate" after emergency mode had been entered.
+	 * Fix "marsadm resize" capacity propagation from underlying LVM.
+	 * Update test suite.
+
+light0.1beta0.13
+--------
+	
+	 * Fix shutdown during operation (flying requests).
+	 * Fix unnecessary Lamport clock propagation storms.
+	 * Improve unnecessary page cache utilisation (mapfree).
+	 * Update test suite.
+
+	
+light0.1beta0.12 and earlier
+--------
+	
+	There was no dedicated ChangeLog. For details, look at the
+	commit history.
+	
+Release Policy / Software Lifecycle
+-----------------------------------
+
+	New source releases are simply announced by appearance of git tags.

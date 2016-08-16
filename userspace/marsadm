@@ -1,5 +1,25 @@
 #!/usr/bin/perl -w
-# (c) 2010 Thomas Schoebel-Theuer / 1&1 Internet AG
+#
+# MARS Long Distance Replication Software
+#
+# This file is part of MARS project: http://schoebel.github.io/mars/
+#
+# Copyright (C) 2010-2014 Thomas Schoebel-Theuer
+# Copyright (C) 2011-2014 1&1 Internet AG
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write to the Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
 use strict;
 use English;
@@ -9,53 +29,378 @@ umask 0077;
 
 ##################################################################
 
+# global defaults
+
+my $threshold = 10 * 1024 * 1024;
+my $window = 30;
+my $verbose = 0;
+my $dry_run = 0;
+
+##################################################################
+
 # messaging
 
-my $warn = "";
+my $error_count = 0;
 my $notify = "";
+my $logger = "/usr/bin/logger";
+
+sub llog {
+  my ($text) = @_;
+  if ($notify) {
+    system("$logger -t marsadm \"$notify $text\"");
+  }
+}
 
 sub lprint {
   my ($text) = @_;
-  print "$warn$text";
-  if ($notify) {
-    system("/usr/bin/logger -t marsadm \"$warn$notify $text\"");
-  }
+  $OUTPUT_AUTOFLUSH = 1;
+  print $text;
+  llog($text);
+}
+
+sub lprint_stderr {
+  my ($text) = @_;
+  $OUTPUT_AUTOFLUSH = 1;
+  print STDERR $text;
+  llog($text);
 }
 
 sub ldie {
   my ($text) = @_;
-  $warn = "DYING: ";
-  lprint $text;
-  exit -1;
+  if ($verbose > 2) {
+    my $i = 1;
+    for (;;) {
+      my ($package, $filename, $line, $subroutine, $hasargs, $wantarray, $evaltext, $is_require, $hints, $bitmask, $hinthash) = caller($i++);
+      last unless defined($subroutine);
+      lprint_stderr "$line:$subroutine\n";
+    }
+  }
+  $error_count++;
+  lprint_stderr "DYING: $text";
+  llog("DYING: $text");
+  die "\n";
 }
 
 sub lwarn {
   my ($text) = @_;
-  my $oldwarn = $warn;
-  $warn = "WARNING: ";
-  lprint $text;
-  $warn = $oldwarn;
+  lprint_stderr "WARNING: $text";
+  llog("WARNING: $text");
 }
 
 ##################################################################
 
 # global variables
 
-my $Id = '$Id$';
+my $Id = '$Id$ ';
+my $user_version = 0.1;
 my $mars = "/mars";
 my $host = `uname -n` or ldie "cannot determine my network node name\n";
 chomp $host;
+check_id($host);
+my $real_host = $host;
 my $force = 0;
-my $ip = _get_ip() or ldie "cannot determine my IP address\n";
+my $timeout = -1;
+my $ip = "";
+my $kernel_version = 0;
+
+##################################################################
+
+# path correction
+
+sub correct_path {
+  my ($path) = @_;
+  # actual switches
+  $path =~ s:(/is-attach)[a-z]*$:$1ed:;
+  $path =~ s:(/is-)(fetch)[a-z]*$:$1copy:;
+  $path =~ s:(/is-)(apply)[a-z]*$:$1replay:;
+  $path =~ s:(/is-(copy|replay|sync))[a-z]*$:$1ing:;
+  # todo switches
+  $path =~ s:(/fetch)[a-z]*$:/connect:;
+  $path =~ s:(/apply)[a-z]*$:/allow-replay:;
+  $path =~ s:(/replay)[a-z]*$:/allow-replay:;
+  return $path;
+}
+
+##################################################################
+
+# low-level infrastructure
+
+my @link_list = ();
+my %link_hash;
+
+sub get_link {
+  my ($path, $unchecked) = @_;
+  my $result = readlink($path);
+  if (!defined($result)) {
+    ldie  "cannot read symlink '$path'\n" unless $unchecked;
+    lwarn "cannot read symlink '$path'\n" if $unchecked == 1;
+    $result = "";
+  }
+  return $result;
+}
+
+sub get_link_stamp {
+  my ($path) = @_;
+  my @stat = lstat($path);
+  return 0 if (!@stat);
+  return $stat[9];
+}
+
+sub is_link_recent {
+  my ($path, $wind) = @_;
+  $wind = $window unless defined($wind);
+  my @stat = lstat($path);
+  return 0 if (!@stat);
+  return 1 if $stat[9] + $wind >= mars_time();
+  return 0;
+}
+
+sub to_tmp {
+  my $path = shift;
+  $path =~ s:^(.*)/:$1/.tmp.:;
+  return $path;
+}
+
+sub from_tmp {
+  my $path = shift;
+  $path =~ s:^(.*)/\.tmp\.:$1/:;
+  return $path;
+}
+
+sub set_link {
+  my ($src, $dst) = @_;
+  my $dst_tmp = to_tmp($dst);
+  unlink($dst_tmp);
+  symlink($src, $dst_tmp) or ldie "cannot create symlink '$dst' -> '$src'\n";
+  # the _order_ is important! remove existing intermediate element before re-appanding
+  if (exists($link_hash{$dst})) {
+    my @copy = @link_list;
+    @link_list = ();
+    foreach my $elem (@copy) {
+      next if $elem eq $dst;
+      push @link_list, $elem;
+    }
+  }
+  $link_hash{$dst} = $src;
+  push @link_list, $dst;
+}
+
+sub finish_links {
+  return unless @link_list;
+  my $timestamp = mars_time();
+  lprint "using lamport timestamp $timestamp\n" if $verbose;
+  while (my $link = shift @link_list) {
+    my $link_tmp = to_tmp($link);
+    my $target = readlink($link_tmp);
+    my $this_timestamp = $timestamp;
+    # allow overriding of secondaries in partitioned clusters by use of small timestamps
+    if ($target eq "(none)") {
+      my @stat = lstat($link);
+      $this_timestamp = $stat[9] + 1 if @stat;
+    }
+    system("touch -h -d \"\@$this_timestamp\" $link_tmp") == 0 or ldie "cannot set mtime on symlink '$link_tmp'\n";
+    if ($dry_run) {
+      lprint "DRY_RUN: would create symlink '$link' -> '$target'\n";
+      unlink($link_tmp);
+      next;
+    }
+    rename($link_tmp, $link) or ldie "cannot finalize symlink '$link'\n";
+    if ($verbose) {
+      lprint "created symlink '$link' -> '$target'\n";
+    }
+  }
+  _trigger();
+}
+
+##################################################################
+
+# global checks
+
+unless (defined($ARGV[0]) && $ARGV[0] =~ m/cluster|cat/) {
+  $kernel_version = get_link("$mars/tree-$host", 1);
+  if ($kernel_version && $user_version != $kernel_version) {
+    lwarn "kernel_version=$kernel_version user_version=$user_version\n";
+    if ($user_version < $kernel_version) {
+      ldie "Sorry, your MARS kernel module uses version $kernel_version, but my $0 userspace version is only $user_version. That cannot work. Please upgrade your userspace scripts!\n";
+    } elsif (int($user_version) > int($kernel_version) + 1) {
+      ldie "MAJOR VERSION mismatch : only one major upgrade step is supported.\n";
+    }
+    lwarn "using different minor versions is possible, but you should upgrade your kernel module ASAP\n";
+  }
+}
+
+sub get_alive_links {
+  my $res = shift || "all";
+  my $alive = shift || "alive";
+  my $hosts = shift || "*";
+  my $glob = "$mars/$alive-$hosts";
+  if ($res ne "all" && $hosts ne "*") {
+    $glob = "$mars/$alive-{";
+    my $count = 0;
+    foreach my $peer (glob("$mars/resource-$res/data-*")) {
+      $peer =~ m:/data-(.+):;
+      $glob .= "," if $count++;
+      $glob .= $1;
+    }
+    $glob .= "}";
+  }
+  my %links;
+  foreach my $path (glob($glob)) {
+    $path =~ m:/$alive-(.+):;
+    my $peer = $1;
+    $links{$peer} = get_link($path);
+  }
+  return %links;
+}
+
+##################################################################
+
+# timeout handling
+
+#
+# return the lamport clock time in nanosecond resolution
+# fallback to system time()
+#
+sub mars_time {
+  my $lamport_time;
+  if (open(my $lamport_clock, "<", "/proc/sys/mars/lamport_clock")) {
+    while (<$lamport_clock>) {
+      $lamport_time = $1 if /^lamport_now=(.*)/;
+    }
+    close($lamport_clock);
+  }
+  return $lamport_time || time() . "." . '0' x 9;
+}
+
+sub sleep_timeout {
+  my $sleeptime = shift || 5;
+  my $continue = shift;
+  if ($timeout < 0) {
+    sleep($sleeptime);
+    return;
+  }
+  if ($timeout <= 0) {
+    if (!defined($continue) || !$continue) {
+      ldie "Timeout reached.\n";
+    }
+    lwarn "Timeout reached. Continuing anyway.\n";
+  }
+  my $rest = $timeout;
+  $rest = $sleeptime if $rest > $sleeptime;
+  sleep($rest);
+  $timeout -= $rest;
+}
+
+# wait for some condition
+sub wait_cond {
+  my ($cmd, $res, $specific) = @_;
+  my $is_actual = ($specific =~ s/^(is|has)-//);
+  $specific =~ s/^todo-//;
+  my $is_on = !($specific =~ s/-(off|0)$//);
+  $specific =~ s/-(on|1)$//;
+  if ($is_actual) {
+    if ($specific eq "device") {
+      check_mars_device($cmd, $res, 1, !$is_on);
+      return;
+    }
+    my %table =
+      (
+       "attach" => "is-attached",
+       "attached" => "is-attached",
+       "replay"   => "is-replaying",
+       "replaying"=> "is-replaying",
+       "fetch"    => "is-copying",
+       "fetching" => "is-copying",
+       "copy"     => "is-copying",
+       "copying"  => "is-copying",
+       "sync"     => "is-syncing",
+       "syncing"  => "is-syncing",
+       "primary" => "is-primary",
+      );
+    my $name = $table{$specific};
+    ldie "actual indicator '$specific' does not exist\n" unless exists($table{$specific});
+    check_status($cmd, $res, $name, $is_on ? 1 : 0, 1, 1);
+  } else {
+    my %table =
+      (
+       "attach" => "attach",
+       "attached" => "attach",
+       "fetch" => "fetch",
+       "connect" => "fetch",
+       "replay" => "replay",
+       "sync" => "sync",
+      );
+    my $name = $table{$specific};
+    ldie "button '$specific' does not exist\n" unless exists($table{$specific});
+    check_todo($cmd, $res, $name, $is_on ? 1 : 0, 1);
+  }
+}
+
+# wait until some communication has occurred
+sub wait_cluster {
+  my $cmd = shift;
+  my $res = shift || "all";
+  my $hosts = shift || "*";
+  my $old_timeout = $timeout;
+  my $start_time = mars_time();
+  _trigger();
+  my $delta = $timeout > 0 ? $timeout : 30;
+  while (1) {
+    my $dead_count = 0;
+    my $alive_count = 0;
+    my $unknown_count = 0;
+    my %status = get_alive_links($res, "time", $hosts);
+    my $now = mars_time();
+    foreach my $peer (keys(%status)) {
+      next if $peer eq $host;
+      if ($status{$peer} >= $start_time) {
+	$alive_count++;
+      } elsif ($status{$peer} + $delta < $now) {
+	$dead_count++;
+      } else {
+	$unknown_count++;
+      }
+    }
+    if (!$unknown_count) {
+      if (!$dead_count) {
+	lprint "all $alive_count peer(s) seem to be alive\n";
+	last;
+      } else {
+	lwarn "$alive_count peer(s) seem to be alive, and $dead_count peer(s) seem to be dead / not reachable\n";
+	ldie "aborting because --force was given\n" if $force;
+      }
+    }
+    sleep_timeout();
+    last if $timeout <= 0 && !$unknown_count;
+  }
+  $timeout = $old_timeout;
+}
 
 ##################################################################
 
 # syntactic checks
+# (also check for existence)
 
 sub check_id {
-  my $str = shift;
-  ldie "identifier '$str' has disallowed characters" unless $str =~ m/^[A-Za-z_][-A-Za-z0-9_]*$/;
-  ldie "identifier '$str' is too long (only 16 chars allowed)" if length($str) > 16;
+  my ($str, $must_exist) = @_;
+  ldie "identifier '$str' is empty" unless defined($str) && $str;
+  ldie "identifier '$str' has disallowed characters" unless $str =~ m/^[A-Za-z0-9_][-A-Za-z0-9_]*$/;
+  ldie "identifier '$str' is too long (only 63 chars supported according to RFC 1123)" if length($str) > 63;
+  if (defined($must_exist) && $must_exist) {
+    my $ip_path = "$mars/ips/ip-$str";
+    unless (get_link($ip_path, 1)) {
+      ldie "host '$str' does not exist in $mars/ips/\n" if !$force;
+      lwarn "host '$str' does not exist in $mars/ips/ - hopefully you know what you are doing via --force\n";
+    }
+  }
+}
+
+sub check_id_list {
+  my ($str, $must_exist) = @_;
+  ldie "comma-separated list '$str' has disallowed characters" unless $str =~ m/^[A-Za-z0-9_][-A-Za-z0-9_,]*$/;
+  foreach my $id (split(",", $str)) {
+    check_id($id, $must_exist);
+  }
 }
 
 ##################################################################
@@ -64,24 +409,24 @@ sub check_id {
 
 sub check_res {
   my $res = shift;
-  if(not -d "$mars/resource-$res") {
+  if (not -d "$mars/resource-$res") {
     # DO WHAT I MEAN: try to substitute a device name for a badly given resource name if it is unique
     my $count = 0;
     my $found;
     my @tests = glob("$mars/resource-*/device-$host");
     foreach my $test (@tests) {
-      my $target = readlink($test);
-      if($target eq $res) {
+      my $target = get_link($test, 2);
+      if ($target eq $res) {
 	$found = $test;
 	$count++;
       }
     }
-    if(!$count) {
+    if (!$count) {
       @tests = glob("$mars/resource-*/_direct-*-$host");
       foreach my $test (@tests) {
-	my $target = readlink($test);
+	my $target = get_link($test, 2);
 	$target =~ s/^.*,//;
-	if($target eq $res) {
+	if ($target eq $res) {
 	  $found = $test;
 	  $count++;
 	}
@@ -95,109 +440,249 @@ sub check_res {
   return $res;
 }
 
+sub _get_mars_size {
+  my ($cmd, $res) = @_;
+  my $dev_name = get_link("$mars/resource-$res/device-$host");
+  my $info = "/sys/devices/virtual/block/mars!$dev_name/size";
+  return `cat $info` * 512;
+}
+
+sub check_sizes {
+  my ($res, $peer) = @_;
+  my $physical_size = get_link("$mars/resource-$res/actsize-$peer", 2) || return;
+  my $logical_size = get_link("$mars/resource-$res/size", 1);
+  if (defined($physical_size) && $physical_size < $logical_size) {
+    lwarn "Physical device on host '$peer' has size $physical_size, which is smaller than the logical resource size $logical_size\n";
+    ldie "This is too dangerous. It cannot work. Fix it!\n" unless $force;
+  }
+}
+
 sub check_res_member {
-  my $res = shift;
-  ldie "sorry, I have not yet joined to resource '$res'\n" unless -e "$mars/resource-$res/data-$host";
+  my ($cmd, $res) = @_;
+  if (! -l "$mars/resource-$res/data-$host") {
+    if (-l "$mars/resource-$res/replay-$host") {
+      lwarn "Resource '$res' seems to have been destroyed.\n";
+      lwarn "Nevertheless, a replay link exists for host '$host'.\n";
+      lwarn "This can happen after 'leave-resource --host=$host' while host $host was active.\n";
+      lwarn "mars-manual.pdf forbids any usage of such a resource _strongly_.\n";
+      lwarn "In order to finally remove this resource from $host, use the\n";
+      lwarn "command 'marsadm leave-resource --force $res'\n";
+    } else {
+      lwarn "Sorry, I have not yet joined to resource '$res'\n";
+    }
+    ldie "Refusing work on resource name '$res'\n" unless $force;
+    lwarn "Running '$cmd' is dangerous, continuing on your own risk\n" unless $cmd eq "leave-resource";
+  }
+  check_sizes($res, $host);
 }
 
 sub check_sync_finished {
-  my ($res, $host) = @_;
-  my $lnk = "$mars/resource-$res/syncstatus-$host";
-  if(lstat($lnk)) {
-    my $syncstatus = readlink($lnk);
-    my $size = readlink("$mars/resource-$res/size") or ldie "cannot read size\n";
-    ldie "sync has not yet finished, only $syncstatus / $size bytes transferred\n" unless $syncstatus >= $size;
+  my ($res, $peer) = @_;
+  check_sizes(@_);
+  my $lnk = "$mars/resource-$res/syncstatus-$peer";
+  if (lstat($lnk)) {
+    my $syncstatus = get_link($lnk, 1);
+    my $size = get_link("$mars/resource-$res/size");
+    unless ($syncstatus >= $size) {
+      lwarn "Sync has not yet finished on host '$peer', only $syncstatus / $size bytes are transferred\n";
+      if ($peer eq $host) {
+	lwarn "Don't try to make inconsistent host '$host' the new primary!\n";
+	lwarn "Please wait until sync has finished and all logfile have been replayed.\n";
+      } else {
+	lwarn "Changing the primary role during sync is dangerous for data consistency on host '$peer'!\n";
+      }
+      ldie "First stop the sync before trying to switch primary!\n" unless $force;
+    }
   }
-  lprint "OK, it seems that sync has finished on $host.\n";
+  lprint "OK, it seems that sync has finished on host '$peer'.\n";
 }
 
 sub check_primary {
   my ($cmd, $res) = @_;
-  my $pri = "$mars/resource-$res/primary";
-  my $old = readlink($pri) or ldie "cannot determine current primary\n";
-  ldie "for operation '$cmd' I need to be primary\n" unless $old eq $host;
+  my $lnk = "$mars/resource-$res/actual-$host/is-primary";
+  my $is_primary = get_link($lnk, 1);
+  if (!$is_primary) { # give it a second chance
+    my $name = get_link("$mars/resource-$res/device-$host", 1);
+    my $dev = "/dev/mars/$name";
+    $is_primary = 1 if -b $dev;
+  }
+  ldie "for operation '$cmd' I need to be primary\n" unless $is_primary;
+  my $primary = _get_designated_primary($res);
+  ldie "for operation '$cmd', I also must be the designated primary\n" unless $primary eq $host;
 }
 
 sub check_not_primary {
   my ($cmd, $res) = @_;
-  my $pri = "$mars/resource-$res/primary";
-  my $old = readlink($pri) or ldie "cannot determine current primary\n";
-  ldie "operation '$cmd' cannot be executed on primary\n" if $old eq $host;
+  my $lnk = "$mars/resource-$res/actual-$host/is-primary";
+  my $is_primary = get_link($lnk, 1);
+  if ($is_primary) {
+    ldie "operation '$cmd' cannot be executed on primary\n" unless $force;
+    lwarn "operation '$cmd' is forced on actual primary '$host', THIS IS RISKY\n";
+  }
+  # also check whether we intend to become primary
+  my $primary = _get_designated_primary($res);
+  ldie "operation '$cmd' cannot be executed on designated primary\n" if $primary eq $host;
 }
 
 sub check_primary_gone {
   my ($res) = @_;
-  for(;;) {
-    my @links = glob("$mars/resource-$res/actual-*/is-primary");
-    my $found = 0;
-    foreach my $link (@links) {
-      my $val = readlink($link);
-      $found++ if $val;
-    }
-    last if !$found;
-    lprint "waiting for $found other primary host(s) to disappear....\n";
-    sleep(5);
+  for (;;) {
+    my $pri = _get_actual_primary($res);
+    last if !$pri;
+    last if $pri eq $host;
+    lprint "waiting for other primary host ($pri) to disappear....\n";
+    sleep_timeout();
   }
+}
+
+sub _make_messages {
+  my ($cmd, $res, $key, $val, $wait, $unchecked, $inv) = @_;
+  my %table =
+    (
+     "is-attached"  => "attach",
+     "is-syncing"   => "sync",
+     "is-copying"   => "fetch",
+     "is-replaying" => "replay",
+     "is-primary"   => "primary",
+    );
+  my $key_msg = defined($table{$key}) ? $table{$key} : $key;
+  my $val_msg = $val ? "on" : "off";
+  my $wait_msg = $wait ? "waiting until" : "ensuring that";
+  my $new_val = (defined($inv) && $inv) ? !$val : $val;
+  my $action_msg = ($new_val ? "'resume-" : "'pause-") . $key_msg . "'";
+  if ($key_msg eq "primary") {
+    $action_msg = $new_val ? "'$key_msg'" : "'secondary' (or better 'primary' on another host)";
+  } elsif ($key_msg eq "attach") {
+    $action_msg = $new_val ? "'$key_msg'" : "'detach'";
+  }
+  $action_msg = "Use $action_msg and/or wait until it has really succeeded.";
+  $action_msg .= " Notice that MARS is an ASYNCHRONOUS system, where both execution of actions, as well as propagation over the network may take some time." if $verbose;
+  $action_msg .= " Don't expect magic to happen if the network has some problems, or when the system load is extremely high." if $verbose > 1;
+  $action_msg .= " Please read the PDF manual, and try to understand it." if $verbose > 2;
+  return ($key_msg, $val_msg, $wait_msg, $action_msg);
 }
 
 sub check_todo {
-  my ($res, $key, $val, $wait) = @_;
-  for(;;) {
-    my $path = "$mars/resource-$res/todo-$host/$key";
-    my $link = readlink($path) or ldie "cannot read symlink '$path'\n";
-    last if $link == $val;
-    ldie "$path must have value $val\n" if $wait;
-    lprint "waiting until $key reaches the value $val....\n";
-    sleep(5);
+  my ($cmd, $res, $key, $val, $wait, $unchecked, $inv) = @_;
+  my ($key_msg, $val_msg, $wait_msg, $action_msg) = _make_messages(@_);
+  $key =~ s/fetch/connect/;
+  my $path = "$mars/resource-$res/todo-$host/$key";
+  $path = correct_path($path);
+  my $link;
+  for (;;) {
+    $link = get_link($path, $unchecked);
+    return unless defined($link);
+    if (defined($inv) && $inv) {
+      last if $link != $val;
+      lprint "$wait_msg switch '$key' != '$val'....\n";
+      ldie "Cannot execute $cmd on resource $res: todo-switch '$key_msg' must not be $val_msg. $action_msg\n" if !$wait;
+    } else {
+      last if $link == $val;
+      lprint "$wait_msg switch '$key' == '$val'....\n";
+      ldie "Cannot execute $cmd on resource $res: todo-switch '$key_msg' must be $val_msg, but actually has value '$link'. $action_msg\n" if !$wait;
+    }
+    sleep_timeout();
   }
+  lprint "OK, '$path' has acceptable value '$link'\n";
 }
 
 sub check_status {
-  my ($res, $key, $val, $wait) = @_;
-  for(;;) {
-    my $path = "$mars/resource-$res/actual-$host/$key";
-    my $link = readlink($path) or ldie "cannot read symlink '$path'\n";
-    last if $link == $val;
-    ldie "$path must have value $val\n" if $wait;
-    lprint "waiting until $key reaches the value $val....\n";
-    sleep(5);
+  my ($cmd, $res, $key, $val, $wait, $unchecked, $inv) = @_;
+  my ($key_msg, $val_msg, $wait_msg, $action_msg) = _make_messages(@_);
+  my $path = correct_path("$mars/resource-$res/actual-$host/$key");
+  my $link;
+  for (;;) {
+    $link = get_link($path, $unchecked);
+    $link = 0 unless (defined($link) && $link ne "");
+    if (defined($inv) && $inv) {
+      last if $link != $val;
+      lprint "$wait_msg actual '$key' != '$val'...\n";
+      ldie "Cannot execute $cmd on resource $res: actual '$key_msg' must not be $val_msg. $action_msg Also ensure that your command _can_ succeed.\n" if !$wait;
+    } else {
+      last if $link == $val;
+      lprint "$wait_msg actual '$key' == '$val'...\n";
+      ldie "Cannot execute $cmd on resource $res: actual '$key_msg' must be $val_msg. $action_msg Also ensure that your command _can_ succeed.\n" if !$wait;
+    }
+    sleep_timeout();
   }
+  lprint "OK, '$path' has acceptable value '$link'\n";
 }
 
-sub _check_mtime {
-  my ($path, $age) = @_;
-  my $mt = (lstat($path))[9];
-  if(!$mt) {
-    return 0;
+sub check_mars_device {
+  my ($cmd, $res, $wait, $inv) = @_;
+  my $name = get_link("$mars/resource-$res/device-$host", $inv);
+  my $dev = "/dev/mars/$name";
+  my $backoff = 1;
+  my $round = 0;
+  if ($inv) {
+    while (-b $dev) {
+      ldie "cannot execute $cmd: device '$dev' has not yet disappeared\n" if !$wait;
+      lwarn "device '$dev' has not yet disappeared\n";
+      sleep_timeout($backoff);
+      # very slowly increasing backoff
+      if ($backoff < 10 && $round++ > 5) {
+	$round = 0;
+	$backoff++;
+      }
+    }
+    lprint "device '$dev' is no longer present\n" unless -b $dev;
+    return;
   }
-  my $res = ($mt < time() - $age);
-  #lprint "XXX '$path' $res\n";
-  return $res;
-}
-
-sub _check_all_mtimes {
-  my ($path, $age) = @_;
-  my @list = glob($path);
-  my $res = 1;
-  foreach my $p (@list) {
-    if(!_check_mtime($p, $age)) {
-      $res = 0;
+  # !$inv
+  my $primary = _get_designated_primary($res);
+  ldie "for operation '$cmd', I should be the designated primary\n" unless $primary eq $host;
+  while (! -e $dev) {
+    my $text = get_error_text($cmd, $res);
+    lprint $text if $text;
+    ldie "aborting due to errors\n" if $text =~ m/error/mi;
+    ldie "cannot execute $cmd: device '$dev' not yet present\n" if !$wait;
+    lprint "device '$dev' not yet present\n";
+    sleep_timeout($backoff);
+    # very slowly increasing backoff
+    if ($backoff < 10 && $round++ > 5) {
+      $round = 0;
+      $backoff++;
     }
   }
-  return $res;
+  lprint "device '$dev' is present\n" if -b $dev;
 }
+
+sub check_userspace {
+  my ($dst) = @_;
+  if ($dst !~ m:/userspace/:) {
+    ldie "your path '$dst' must be inside $mars/userspace/ or $mars/resource-*/userspace/\n" unless $force;
+    lwarn "your path '$dst' is outside $mars/userspace/ or $mars/resource-*/userspace/ and you gave --force, hopefully YOU KNOW WHAT YOU ARE DOING\n";
+  }
+}
+
+sub check_sync_startable {
+  my ($cmd, $res) = @_;
+  my $primary = _get_designated_primary($res);
+  ldie "Cannot execute '$cmd' because noone is designated as primary.\n" if (!$primary || $primary eq "(none)");
+  # no danger when switch is turned on at the primary side.
+  return if $primary eq $host;
+  my $emergency_path = "$mars/resource-$res/actual-$primary/has-emergency";
+  my $emergency = get_link($emergency_path, 1);
+  if ($emergency) {
+    ldie "Primary '$primary' is in emergency mode. Cannot start sync.\nFree some space there first.\n";
+  }
+}
+
+##################################################################
+
+# state inspection routines
 
 sub _get_minmax {
   my ($res, $glob, $take_symlink) = @_;
   my $min = -1;
   my $max = -1;
-  my @paths = glob($glob) or ldie "cannot find '$glob'\n";
+  my @paths = glob($glob) or lwarn "cannot find '$glob'\n";
   foreach my $path (@paths) {
     my $nr = $path;
-    if($take_symlink) {
-      $nr = readlink($path) or ldie "cannot read symlink '$path'\n";
+    if ($take_symlink) {
+      $nr = get_link($path, 1);
     }
-    $nr =~ s:^.*[a-z]+-([0-9]+)(-[^/]*)?$:$1:;
+    $nr =~ s@^(?:.*/)?[a-z]+-([0-9]+)(-[^/]*)?$@$1@;
     $min = $nr if ($nr < $min || $min < 0);
     $max = $nr if ($nr > $max || $max < 0);
   }
@@ -205,117 +690,639 @@ sub _get_minmax {
 }
 
 sub get_minmax_logfiles {
-  my ($res) = @_;
-  return _get_minmax($res, "$mars/resource-$res/log-*", 0);
+  my ($res, $peer) = @_;
+  $peer = "" unless defined($peer);
+  return _get_minmax($res, "$mars/resource-$res/log-*$peer", 0);
 }
 
 sub get_minmax_versions {
-  my ($res) = @_;
-  return _get_minmax($res, "$mars/resource-$res/version-*", 0);
+  my ($res, $peer) = @_;
+  $peer = "" unless defined($peer);
+  return _get_minmax($res, "$mars/resource-$res/version-*$peer", 0);
 }
 
 sub get_minmax_any {
-  my ($res) = @_;
-  return _get_minmax($res, "$mars/resource-$res/{log,version}-*", 0);
+  my ($res, $peer) = @_;
+  $peer = "" unless defined($peer);
+  return _get_minmax($res, "$mars/resource-$res/{log,version}-*$peer", 0);
 }
 
 sub get_minmax_replays {
-  my ($res) = @_;
-  return _get_minmax($res, "$mars/resource-$res/replay-*", 1);
+  my ($res, $peer) = @_;
+  $peer = "" unless defined($peer);
+  return _get_minmax($res, "$mars/resource-$res/replay-*$peer", 1);
 }
 
-sub check_splitbrain {
-  # check only the chain of $host (or all hosts if unset)
-  # check up to $sequence (or for all if < 0)
-  my ($res, $host, $sequence) = @_;
-  if($sequence < 0) {
-    my $pri = "$mars/resource-$res/primary";
-    my $old = readlink($pri) or ldie "cannot determine current primary\n";
-    _primary_res($res, "(none)", $pri, $old) unless $old eq "(none)";
-    _trigger();
-    sleep(5);
-    while(!_check_all_mtimes("$mars/resource-$res/{log,version,replay}-*", 60)) {
-      lprint "resource directory $res not stable, waiting....\n";
-      sleep(5);
-    }
-    while(1) {
-      my ($min_log, $max_log) = get_minmax_logfiles($res);
-      my ($min_ver, $max_ver) = get_minmax_versions($res);
-      my ($min_rep, $max_rep) = get_minmax_replays($res);
-      if($min_ver > $min_log || $max_ver < $max_log) {
-	lprint "some version links are missing...\n";
-	sleep(10);
-	next;
+##################################################################
+
+# generic comparisons
+
+sub compare_replaylinks {
+  my ($a, $b) = @_;
+  $a =~ m/log-([0-9]+)[^,]*,([0-9]+)/;
+  my ($a_log, $a_pos) = ($1, $2);
+  $b =~ m/log-([0-9]+)[^,]*,([0-9]+)/;
+  my ($b_log, $b_pos) = ($1, $2);
+  return -1 if $a_log < $b_log;
+  return +1 if $a_log > $b_log;
+  return -1 if $a_pos < $b_pos;
+  return +1 if $a_pos > $b_pos;
+  return 0;
+}
+
+##################################################################
+
+sub get_amount {
+  my ($resdir, $host, $direction, $only_files) = @_;
+  my $level = 0;
+  my $firstpos = 0;
+  my $logpos = 0;
+  my $oldpos = 0;
+  my $sum = 0;
+  for (;;) {
+    my $val0 = 0;
+    my $ok = 0;
+    if (!$level) {
+      my $replay_path = sprintf("%s/replay-%s", $resdir, $host);
+      my $replay_link = get_link($replay_path, 1);
+      return (0, 0, 0, 0) if !$replay_link;
+      return (0, 0, 0, 0) if $replay_link !~ m:log-([0-9]+)-[^,]+,([0-9]+),([0-9]+):;
+      $firstpos = int($1);
+      $logpos = $firstpos;
+      if ($direction < 0) {
+	$sum = $2;
+      } else {
+	$val0 = $2;
+	$sum = $3;
       }
-      if($max_log >= $max_rep) {
-	lprint "resource $res: logfile $max_log is present.\n";
+    }
+    if ($level > 0 || $direction > 0) {
+      my $file = sprintf("%s/log-%09d-%s", $resdir, $logpos, $host);
+      my @stat = stat($file);
+      my $val = 0;
+      if (@stat) {
+	$val = $stat[7];
+	$ok = 1;
+      } else {
+	my $glob = sprintf("%s/log-%09d-*", $resdir, $logpos);
+	foreach $file (glob($glob)) {
+	  my @tstat = stat($file);
+	  if (@tstat && $tstat[7] > $val) {
+	    @stat = @tstat;
+	    $val = $stat[7];
+	    $ok = 1;
+	  }
+	}
+      }
+      if (!$only_files) {
+	my $glob = sprintf("%s/version-%09d-*", $resdir, $logpos);
+	foreach $file (glob($glob)) {
+	  my $vers_link = get_link($file, 1);
+	  if ($vers_link && $vers_link =~ m;,([0-9]+):;) {
+	    my $nval = $1;
+	    $val = $nval if $nval > $val;
+	    $ok = 1;
+	  }
+	}
+      }
+      return ($sum, $firstpos, $oldpos, $level) unless $ok;
+      if ($level > 0) {
+	$sum += $val;
+      } else {
+	# the logfile may be bigger than the replay pos/length
+	my $new_sum = $val - $val0;
+	$sum = $new_sum if $new_sum > $sum;
+	$sum = 0 if $sum < 0;
+      }
+    }
+    $oldpos = $logpos;
+    if ($direction > 0) {
+      $logpos++;
+    } elsif ($direction < 0) {
+      $logpos--;
+      return ($sum, $firstpos, $oldpos, $level) if $logpos < 1;
+    } else {
+      return ($sum, $firstpos, $oldpos, $level);
+    }
+    $level++;
+  }
+}
+
+##################################################################
+
+# versionlink path handling routines
+
+my %visited_pos;
+
+sub _visit {
+  my ($nr, $peer) = @_;
+  $nr =~ s:^0*::;
+  my $visit = "$nr,$peer";
+  $visited_pos{$visit} = 1;
+}
+
+sub _is_visited {
+  my ($nr, $peer) = @_;
+  $nr =~ s:^0*::;
+  my $visit = "$nr,$peer";
+  return $visited_pos{$visit};
+}
+
+sub _parse_pos {
+  my ($basedir, $pos) = @_;
+  if ($pos =~ m/log-([0-9]+)-([^,]+)/) {
+    _visit($1, $2);
+  } elsif ($pos =~ m/version-([0-9]+)-([^,]+)/p) {
+    my $vers = get_link("$basedir/$MATCH");
+    my $count_matches = 0;
+    while ($vers =~ m/log-([0-9]+)-([^,]+)/p) {
+      $vers = $POSTMATCH;
+      _visit($1, $2);
+      $count_matches++;
+    }
+    lwarn "cannot parse '$pos' -> '$vers'\n" unless $count_matches;
+  } else {
+    lwarn "cannot parse '$pos'\n";
+  }
+  $pos =~ m/((?:log|version)-([0-9]+)-([^,]+)(?:,([0-9]+))?)/ or lwarn "cannot parse position info '$pos'\n";
+  return ($1, int($2), $3, defined($4) ? int($4) : -1);
+}
+
+sub _get_prev_pos {
+  my ($basedir, $nr, $peer) = @_;
+  my $path = sprintf("version-%09d-$peer", $nr);
+  my $vers = get_link("$basedir/$path", 2);
+  _parse_pos($basedir, $path) if defined($vers) && $vers;
+  $vers =~ s/^.*://;
+  return $vers;
+}
+
+sub _get_common_ancestor {
+  for (;;) {
+    my ($basedir, $pos1, $host1, $dep1, $pos2, $host2, $dep2) = @_;
+    my ($p1, $nr1, $from1, $len1) = _parse_pos($basedir, $pos1);
+    my ($p2, $nr2, $from2, $len2) = _parse_pos($basedir, $pos2);
+    if ($p1 eq $p2) {
+      # usually no split brain here (only if both path depths are non-zero)
+      my $split = ($dep1 && $dep2);
+      if (!$split) { # additionally check the corresponding version links
+	my $path1 = sprintf("$basedir/version-%09d-$from1", $nr1);
+	my $path2 = sprintf("$basedir/version-%09d-$from2", $nr2);
+	if (my $vers1 = get_link($path1, 1) and my $vers2 = get_link($path2, 1)) {
+	  $split = 1 if $vers1 ne $vers2;
+	}
+      }
+      return ($p1, $split);
+    } elsif ($nr1 > $nr2) {
+      # just flip arguments
+      @_ = ($basedir, $pos2, $host2, $dep2, $pos1, $host1, $dep1);
+      next;
+    } elsif ($nr1 < $nr2) {
+      # recursively advance path depth
+      my $vers2 = _get_prev_pos($basedir, $nr2, $host2);
+      return ("", -1) if !$vers2;
+      @_ = ($basedir, $pos1, $host1, $dep1, $vers2, $host2, $dep2 + 1);
+      next;
+    } elsif ($from1 ne $from2) {
+      # split brain is sure now, but continue computing the common split point
+      my $vers1 = _get_prev_pos($basedir, $nr1, $host1);
+      return ("", 1) if !$vers1;
+      my $vers2 = _get_prev_pos($basedir, $nr2, $host2);
+      return ("", 1) if !$vers2;
+      my ($res, $split) = _get_common_ancestor($basedir, $vers1, $host1, $dep1 + 1, $vers2, $host2, $dep2 + 1);
+      return ($res, 1);
+    } elsif ($len1 < $len2) {
+      # there may be no split brain (just incomplete replay) depending on path depth
+      return ($p1, $dep1);
+    } elsif ($len2 < $len1) {
+      # dto symmetric
+      return ($p2, $dep2);
+    }
+    lwarn "error in algorithm: $p1, $nr1, $from1, $len1 : $p2, $nr2, $from2, $len2\n";
+    return ("", -1);
+  }
+}
+
+sub get_common_ancestor {
+  my ($basedir, $host1, $host2) = @_;
+  my $repl1 = get_link("$basedir/replay-$host1", 1);
+  my $repl2 = get_link("$basedir/replay-$host2", 1);
+  return _get_common_ancestor($basedir, $repl1, $host1, 0, $repl2, $host2, 0);
+}
+
+my %detected_splits = ();
+
+sub detect_splitbrain {
+  my ($res, $do_report) = @_;
+  # dynamic programming
+  return $detected_splits{$res} if defined($detected_splits{$res});
+  my $basedir = "$mars/resource-$res";
+  my $ok = 1;
+  my @list = glob("$mars/resource-$res/replay-*");
+  my @hosts = map { $_ =~ s:.*/replay-::; $_ } @list;
+  foreach my $host1 (@hosts) {
+    foreach my $host2 (@hosts) {
+      next if $host1 ge $host2;
+      my ($res, $split) = get_common_ancestor($basedir, $host1, $host2);
+      if ($split) {
+	$ok = 0;
+	if ($do_report) {
+	  lwarn "SPLIT BRAIN at '$res' detected: hostA = '$host1', hostB = '$host2'\n";
+	} else {
+	  return $ok;
+	}
+      }
+    }
+  }
+  if ($ok) { # check for duplicate logfiles
+    my @logs = glob("$mars/resource-$res/log-*");
+    my $oldnr = -1;
+    foreach my $path (sort(@logs)) {
+      $path =~ m:/log-([0-9]+):;
+      my $nr = $1;
+      if ($nr == $oldnr) {
+	$ok = 0;
+	lwarn "SPLIT BRAIN at '$res' detected: duplicate logfile number $nr\n";
+	lwarn "hint: first resolve split brain by 'leave-resource' or 'invalidate'\n";
+	lwarn "hint: if this does not help, try cleanup via 'log-purge-all'\n";
+	lwarn "hint: if this does not help, try 'log-purge-all --force'\n";
 	last;
       }
-      lprint "resource $res: logfile $max_log is not yet transferred (need $max_rep), waiting....\n";
-      sleep(10);
+      $oldnr = $nr;
     }
-  } # $sequence < 0
+  }
+  $detected_splits{$res} = $ok;
+  return $ok;
+}
 
-  my $glob = "$mars/resource-$res/version-[0-9]*";
-  my @links = glob($glob);
-  if(!@links) {
-    @links = glob("$mars/resource-$res/version-[0-9]*-*");
-    ldie "no version information available\n" unless @links;
-    lprint "assuming that I am primary for the first time\n";
+sub _mark_path_backward {
+  my ($basedir, $pos, $peer, $skip, $jump_peer) = @_;
+  my $sum = 0;
+  my $base_nr = 0;
+  for (;;) {
+    my ($p, $nr, $from, $len) = _parse_pos($basedir, $pos);
+    last if defined($skip) && $nr < $skip;
+    $base_nr = $nr;
+    _visit($nr, $peer);
+    # When following chains from foreign hosts (e.g. the designated primary),
+    # we must jump over to our own chain somewhen, because the lengths of
+    # the chains may be different (caused by invalidate & friends).
+    if (defined($jump_peer) && $jump_peer ne $peer) {
+      my $peer_path = sprintf("$basedir/version-%09d-$peer", $nr);
+      my $jump_path = sprintf("$basedir/version-%09d-$jump_peer", $nr);
+      my $peer_version = get_link($peer_path, 2);
+      my $jump_version = get_link($jump_path, 2);
+      if (defined($peer_version) && defined($jump_version) && $peer_version eq $jump_version) {
+	$peer = $jump_peer;
+      }
+    }
+    $pos = _get_prev_pos($basedir, $nr, $peer, 1);
+    last if !$pos;
+    # optionally don't count the last versionlink, pointing into nirvana
+    if (defined($skip) && $skip && $nr > 1) {
+      my ($p, $nr, $from, $len) = _parse_pos($basedir, $pos);
+      last if !$p;
+      my $next = _get_prev_pos($basedir, $nr, $peer, 1);
+      last if !$next;
+    }
+    $sum += $len;
+  }
+  return ($sum, $base_nr);
+}
+
+sub _mark_path_forward {
+  my ($basedir, $pos, $peer) = @_;
+  my @list = ($pos);
+  while (@list) {
+    my %next_list;
+    foreach $pos (@list) {
+      my ($p, $nr, $from, $len) = _parse_pos($basedir, $pos);
+      my $cand = sprintf("$basedir/version-%09d-$peer", $nr + 1);
+      my $vers = get_link($cand, 2);
+      next unless defined($vers) && $vers ne "";
+      $vers =~ s/^.*://;
+      my ($cp, $cnr, $cfrom, $clen) = _parse_pos($basedir, $vers);
+      if (int($cnr) == int($nr) && $cfrom eq $from && $clen == $len) {
+	$next_list{$cand} = 1;
+      }
+    }
+    @list = keys(%next_list);
+  }
+}
+
+sub _mark_path_transitive {
+  _mark_path_forward(@_);
+  _mark_path_backward(@_);
+}
+
+sub log_purge_res {
+  my ($cmd, $res) = @_;
+  lwarn "DANGEROUS OPERATION: $cmd --force on resource '$res'\n" if $force;
+  %visited_pos = ();
+  my %start_logs;
+  my $start_count = 0;
+  my $basedir = "$mars/resource-$res";
+  foreach my $data (glob("$basedir/{data,replay}-*")) {
+    $data =~ m:/(data|replay)-(.+):;
+    my $peer = $2;
+    my $replay = "$basedir/replay-$peer";
+    my $target = get_link($replay, 1);
+    lprint "found replay link '$replay' -> '$target'\n";
+    $target =~ s/,.*//;
+    $start_logs{$target}++;
+    $start_count++;
+    _mark_path_transitive($basedir, $target, $peer);
+  }
+  if (!$start_count) {
+    ldie "Resource contains no valid information - refusing to delete everything for safety reasons\n";
+  }
+  my %logs;
+  foreach my $file (glob("$basedir/version-*")) {
+    $file =~ m:/(version-([0-9]+)-([^,]+)): or ldie "bad path '$file'\n";
+    my $cand = $1;
+    my $nr = $2;
+    my $from = $3;
+    lprint "checking '$cand'\n";
+    my $vers = get_link($file, 1);
+    $vers =~ m/(log-[0-9]+-[^,:]+)/;
+    my $log = $1;
+    lprint "  corresponding logfile is '$log'\n";
+    if (_is_visited($nr, $from)) {
+      lprint "  ok '$cand'\n";
+      $logs{$log}++;
+      next;
+    }
+    if (!$force && $from ne $host) {
+      lprint "  skipping foreign object '$cand'\n";
+      $logs{$log}++;
+      next;
+    }
+    lwarn "deleting foreign object from peer '$from' because you said --force\n" if $from ne $host;
+    _create_delete($file);
+  }
+  foreach my $file (glob("$basedir/log-*")) {
+    $file =~ m:/(log-[0-9]+-(.*)): or ldie "bad path '$file'\n";
+    my $log = $1;
+    my $from = $2;
+    lprint "checking '$log'\n";
+    if ($logs{$log}) {
+      lprint "  ok '$log'\n";
+      $logs{$log} = -1;
+      next;
+    }
+    if ($start_logs{$log}) {
+      lprint "  ok start '$log'\n";
+      $logs{$log} = -1;
+      next;
+    }
+    if (!$force && $from ne $host) {
+      lprint "  skipping foreign object '$log'\n";
+      next;
+    }
+    lwarn "deleting foreign object from peer '$from' because you said --force\n" if $from ne $host;
+    _create_delete($file);
+  }
+  my $count = 0;
+  foreach my $log (sort(keys(%logs))) {
+    my $nr = $logs{$log};
+    next if $nr < 0 || -e "$basedir/$log";
+    lprint_stderr "info: logfile '$log' is referenced ($nr), but not present.\n";
+    $count++;
+  }
+  if ($count) {
+    lprint_stderr "  Unreferenced logfiles are not necessarily bad.\n";
+    lprint_stderr "  They can regularly appear after 'leave-resource',\n";
+    lprint_stderr "  or 'invalidate', or after emergency mode,\n";
+    lprint_stderr "  or after similar operations.\n";
+  }
+  finish_links();
+  _wait_delete();
+}
+
+sub try_to_avoid_splitbrain {
+  my ($cmd, $res, $old_primary) = @_;
+  my $old_timeout = $timeout;
+  $timeout = $window * 2 if $timeout < 0;
+  $old_primary = "" if $old_primary eq "(none)";
+  wait_cluster($cmd, $res, $old_primary);
+  if (!detect_splitbrain($res, 0)) {
+    lwarn "ATTENTION: you are starting a non-forced primary switchover in a split brain situation.\n";
+    lwarn "ATTENTION: that's no good idea.\n";
+    lwarn "ATTENTION: I will continue to do what you want.\n";
+    lwarn "ATTENTION: But you are responsible for the consequences.\n";
+    $timeout = $old_timeout;
     return;
   }
-
-  @links = sort(@links);
-  foreach my $link (@links) {
-    my $nr = $link;
-    $nr =~ s:^.*[a-z]+-([0-9]+)(-[^/]*)?$:$1:;
-    $nr = int($nr);
-
-    next if ($sequence >= 0 && $nr > $sequence);
-
-    my $fromhost = $link;
-    $fromhost =~ s:^.*version-[0-9]*-(.*)$:$1:;
-
-    my $version = readlink($link) or ldie  "cannot read symlink '$link'\n";
-    my $otherhost = $version;
-    $otherhost =~ s:^[^,]*?,log-[0-9]*?-([^,]*?),.*$:$1:;
-    my $otherlink = sprintf("$mars/resource-$res/version-%09d-$otherhost", $nr);
-    my $otherversion = readlink($otherlink) or ldie  "cannot read symlink '$otherlink'\n";
-
-    # ignore foreign mismatches
-    if($host) {
-      next if $fromhost ne $host;
+  # now try to prevent producing a _new_ split brain situation....
+  my @host_list = glob("$mars/resource-$res/replay-*");
+  $timeout = $old_timeout;
+  return if scalar(@host_list) < 2;
+  $timeout = $window * 2 if $timeout < 0;
+  my $old_situation = "";
+  for (;;) {
+    my ($min, $max) = get_minmax_versions($res);
+    my $vers_glob = sprintf("$mars/resource-$res/version-%09d-*", $max);
+    my $ok = 1;
+    my $replay_err_path = "$mars/resource-$res/actual-$host/msg-err-replay-stop";
+    my $replay_err = get_link($replay_err_path, 1);
+    if ($replay_err && $replay_err ne "OK") {
+      my @stat = lstat($replay_err_path);
+      if ($stat[9] + $window >= mars_time()) {
+	my $msg = _get_text($replay_err);
+	lwarn "cannot guarantee split brain avoidance: $msg\n";
+	last;
+      }
     }
-
-    # by defintion, the originator of a logfile is always "right"
-    next if $otherhost eq $fromhost;
-
-    # final check
-    ldie "splitbrain at sequence $nr detected\n" unless $version eq $otherversion;
+    my $emergency_path = "$mars/resource-$res/actual-$host/has-emergency";
+    my $emergency = get_link($emergency_path, 1);
+    if ($emergency) {
+      ldie "emergency mode $emergency has been entered locally: handover is not possible. Either free some space in $mars/, or use --force to use a potentially outdated version.\n";
+    }
+    my $primary = _get_designated_primary($res);
+    if ($primary eq "(none)") {
+      # try to determine the old primary when unique
+      my $glob_logs = sprintf("$mars/resource-$res/log-%09d-*", $max);
+      my @candidates = glob($glob_logs);
+      if (scalar(@candidates) == 1) {
+	my $log_path = pop @candidates;
+	if ($log_path =~ m:/log-[0-9]+-(.+)$:) {
+	  $primary = $1;
+	  lprint "Using last primary '$primary' as a substitute.\n";
+	}
+      }
+    }
+    # if the old primary is known, we can ignore all other / unrelated hosts
+    if ($primary && $primary ne $host && $primary ne "(none)") {
+      my $p_path = sprintf("$mars/resource-$res/version-%09d-%s", $max, $primary);
+      my $h_path = sprintf("$mars/resource-$res/version-%09d-%s", $max, $host);
+      my $p_vers = get_link($p_path, 1);
+      my $h_vers = get_link($h_path, 1);
+      if (!$p_vers || !$h_vers || $p_vers ne $h_vers) {
+	$ok = 0;
+      }
+    } else {
+      # old primary is unknown: we have no chance, other than comparing _all_ versions.
+      my @versions = glob($vers_glob);
+      my $first = get_link(shift @versions);
+      while (@versions) {
+	my $next = get_link(shift @versions);
+	if ($next ne $first) {
+	  $ok = 0;
+	}
+      }
+    }
+    last if $ok;
+    lprint "Trying to avoid split brain for $timeout s: logfile update not yet completed.\n";
+    my $tpl = get_macro("replinfo");
+    my $new_situation = eval_macro($cmd, $res, $tpl, @_);
+    print $new_situation;
+    $timeout = $window * 2 if $new_situation ne $old_situation;
+    sleep_timeout();
+    $old_situation = $new_situation;
   }
+  $timeout = $old_timeout;
 }
 
 sub get_size {
   my $arg = shift;
-  return -1 unless $arg =~ m/^[0-9.]+[kmgtp]?$/i;
-  my $mod = $arg;
-  $arg =~ s/[^0-9]+$//;
-  $mod =~ s/^[0-9]+//;
+  my $orig_arg = $arg;
+  # Do what I mean: when given a device, take its actual size.
+  if (-b $arg) {
+    my $mangled = $arg;
+    $mangled =~ s:/dev/::;
+    $mangled =~ s:/:!:g;
+    my $path = "/sys/block/$mangled/size";
+    $arg = `cat $path` * 512 if -r $path;
+  }
+  if ($arg !~ m/^([0-9]+(?:\.[0-9]*)?)([kmgtp]?)$/i) {
+    ldie "Size argument '$arg' must be a number, optionally followed by a suffix [kKmMgGtTpP]. Lowercase = multiples of 1000, Uppercase = multiples of 1024.\n";
+  }
+  my $mod = $2 || "";
+  $arg = $1;
   $_ = $mod;
  SWITCH: {
-    /k/i and $arg *= 1024, last SWITCH;
-    /m/i and $arg *= 1024 * 1024, last SWITCH;
-    /g/i and $arg *= 1024 * 1024 * 1024, last SWITCH;
-    /t/i and $arg *= 1024 * 1024 * 1024 * 1024, last SWITCH;
-    /p/i and $arg *= 1024 * 1024 * 1024 * 1024 * 1024, last SWITCH;
+    /^$/ and last SWITCH;
+    /^k$/ and $arg *= 1000, last SWITCH;
+    /^m$/ and $arg *= 1000 * 1000, last SWITCH;
+    /^g$/ and $arg *= 1000 * 1000 * 1000, last SWITCH;
+    /^t$/ and $arg *= 1000 * 1000 * 1000 * 1000, last SWITCH;
+    /^p$/ and $arg *= 1000 * 1000 * 1000 * 1000 * 1000, last SWITCH;
+    /^K$/ and $arg *= 1024, last SWITCH;
+    /^M$/ and $arg *= 1024 * 1024, last SWITCH;
+    /^G$/ and $arg *= 1024 * 1024 * 1024, last SWITCH;
+    /^T$/ and $arg *= 1024 * 1024 * 1024 * 1024, last SWITCH;
+    /^P$/ and $arg *= 1024 * 1024 * 1024 * 1024 * 1024, last SWITCH;
+    ldie "bad unit suffix '$mod'";
   }
+  ldie "size argument '$orig_arg' evaluating to '$arg' is not a multiple of 4K = 4096\n" if ($arg % 4096) != 0;
   return $arg;
+}
+
+# DEPRECATED
+#
+# TST NOTE: avoid calling this function. As such it is conceptually wrong,
+# because during split-brain situations, there exists a _set_ of non-unique
+# primaries. I want to remove this function, but I currently can't because
+# other internal software at 1&1 is depending on it.
+
+#
+# Get actual primary node from links below actual-*/ subdirs
+#
+sub _get_actual_primary {
+  my ($res) = @_;
+  # TST: Presence of local device takes precedence over anything else.
+  # This tries to workaround the most important special case of
+  # split-brain situations, but cannot fix the problem exhaustively.
+  llog "DEPRECATED: you are trying to uniquely identify an actual primary hostname (as seen from host $host resource $res), but this is conceptually wrong because in split-brain situations there may exist multiple ones. Use view-is-primary instead. That would be safe.\n";
+  my $name = get_link("$mars/resource-$res/device-$real_host", 1);
+  my $dev = "/dev/mars/$name";
+  return $real_host if -b $dev;
+  # The following old code is CONCEPTUALLY WRONG for split-brain situations (see NOTE above)
+  my @primary_links = glob("$mars/resource-$res/actual-*/is-primary");
+  my $primary;
+  foreach my $link (@primary_links) {
+    if (my $val = get_link($link)) {
+      $primary = ($link =~ qr%.*actual-([^/]+)/is-primary%)[0];
+      last;
+      # Note: if there are more than one 'is-primary' links (an insane state anyway),
+      # the first 'is-primary' link is selected. Other links are ignored.
+    }
+  }
+  return $primary;
+}
+
+sub _get_designated_primary {
+  my ($res) = @_;
+  return get_link("$mars/resource-$res/primary");
 }
 
 sub get_peers {
   my ($res) = @_;
-  my @list = glob("$mars/resource-$res/connect-*");
-  return map { $_ =~ s:$mars/resource-$res/connect-::; $_ } @list;
+  my @list = glob("$mars/resource-$res/data-*");
+  return map { $_ =~ s:$mars/resource-$res/data-::; $_ } @list;
+}
+
+sub __conv_tv {
+  my ($tv_sec, $tv_nsec) = @_;
+  if (defined($tv_nsec)) {
+    $tv_nsec = ".$tv_nsec";
+  } else {
+    $tv_nsec = "";
+  }
+  my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime(int($tv_sec));
+  return "$tv_sec$tv_nsec" unless defined($sec);
+  return sprintf("%04d-%02d-%02d %02d:%02d:%02d%s", $year+1900, $mon + 1, $mday, $hour, $min, $sec, $tv_nsec);
+}
+
+sub __conv_errno {
+  my ($txt, $error) = @_;
+  return "$txt$error" if !defined($error) || ($error <= 0);
+  $! = $error;
+  my $res = "${txt}${error}[$!]";
+  $! = 0;
+  return $res;
+}
+
+sub _replace_timestamps {
+  my ($txt, $omit_nsec) = @_;
+  if (defined($omit_nsec) && $omit_nsec) {
+    $txt =~ s:([0-9]{9,99})\.([0-9]{9}):__conv_tv($1):ge;
+  } else {
+    $txt =~ s:([0-9]{9,99})\.([0-9]{9}):__conv_tv($1,$2):ge;
+  }
+  $txt =~ s:((error|status)\s*=?\s*-)([0-9]+):__conv_errno($1,$3):ge;
+  return $txt;
+}
+
+sub _get_text {
+  my ($glob, $regex, $do_print, $get_count) = @_;
+  my $text = "";
+  my $count = 0;
+  foreach my $path (glob($glob)) {
+    open(IN, "<", $path) or next;
+    while (my $line = <IN>) {
+      # use regex e.g. for fetching only errors and warnings
+      if (!$regex || $line =~ $regex) {
+	$line = _replace_timestamps($line);
+	$count++;
+	if ($do_print) {
+	  print $line;
+	  llog($line);
+	} else {
+	  $text .= $line;
+	}
+      }
+    }
+    close(IN);
+  }
+  return $count if defined($get_count) && $get_count;
+  return $text;
+}
+
+sub get_error_text {
+  my ($cmd, $res) = @_;
+  my $text = _get_text("$mars/resource-$res/logstatus-$host.status", "m/^(err|warn)/i", 0);
+  return $text;
 }
 
 ##################################################################
@@ -323,23 +1330,19 @@ sub get_peers {
 # helpers
 
 sub _trigger {
-  system("(echo 1 > /proc/sys/mars/trigger) >/dev/null 2>&1");
+  system("(echo 2 > /proc/sys/mars/trigger) >/dev/null 2>&1");
 }
 
 sub _switch {
   my ($cmd, $res, $path, $on) = @_;
   my $src = $on ? "1" : "0";
-
-  my $old = readlink($path);
-  if($old && $old eq $src) {
+  $path = correct_path($path);
+  my $old = get_link($path);
+  if ($old && $old eq $src) {
     lprint "${cmd} on resource $res is already activated\n" if $cmd;
     return;
   }
-
-  my $tmp = $path;
-  $tmp =~ s/\/([^\/]+)$/.tmp.$1/;
-  symlink($src, $tmp) or ldie "cannot create switch symlink\n";
-  rename($tmp, $path) or ldie "cannot rename switch symlink\n";
+  set_link($src, $path);
   lprint "successfully started ${cmd} on resource $res\n" if $cmd;
 }
 
@@ -352,56 +1355,103 @@ sub _writable {
 }
 
 sub _get_ip {
-  chomp (my @info = `/sbin/ip addr show dev eth0`);
-  foreach (@info) {
-    m#\sinet\s(\d+\.\d+\.\d+\.\d+)# && return $1;
+  check_id($host);
+  my $ip_path = "$mars/ips/ip-$host";
+  if (my $from_link = get_link($ip_path, 2)) {
+    lprint_stderr "Using IP '$from_link' from '$ip_path'\n" if $verbose;
+    return $from_link;
+  }
+  chomp (my @info = `/sbin/ip addr show`);
+  my $interface = "";
+  foreach my $line (@info) {
+    $interface = $1 if $line =~ m#^[0-9]+:\s([a-zA-Z_0-9]+):#;
+    next if $interface eq "lo";
+    if ($line =~ m#\sinet\s(\d+\.\d+\.\d+\.\d+)#) {
+      my $from_if = $1;
+      lprint_stderr "Using IP '$from_if' from interface '$interface'\n";
+      return $from_if;
+    }
   }
   return undef;
 }
 
 sub _fake_versionlink {
-  my ($basedir, $prev, $primary) = @_;
-  $prev =~ s/^log-([0-9]+)-.*$/$1/;
-  $prev--;
-  if($prev > 0) {
-    my $prevversion = sprintf("$basedir/version-%09d-$primary", $prev);
-    my $prevlink = readlink($prevversion);
-    if (!$prevlink) { # try any one else
-      $prevversion = sprintf("$basedir/version-%09d-*", $prev);
-      my @test = glob($prevversion);
-      $prevlink = shift @test;
+  my ($basedir, $log_nr, $primary) = @_;
+  my $make_count = 0;
+  for (my $rounds = 2; $rounds > 0 && $log_nr > 0; $rounds--) {
+    my $new_version = sprintf("$basedir/version-%09d-$host", $log_nr);
+    my $pri_version = sprintf("$basedir/version-%09d-$primary", $log_nr);
+    if ($primary eq $host) {
+      ldie "Cannot fake my own version link '$new_version'\n";
     }
-    if ($prevlink) {
-      lprint "creating faked version symlink...\n";
-      my $myversion = sprintf("$basedir/version-%09d-$host", $prev);
-      system("rm -f $myversion.tmp");
-      symlink($prevlink, "$myversion.tmp") or ldie "cannot create faked version symlink '$myversion'\n";
-      system("mv $myversion.tmp $myversion");
+    my $pri_link = get_link($pri_version, 1);
+    if ($pri_link) {
+      lprint "creating new version symlink '$new_version' -> '$pri_link'\n";
+      set_link($pri_link, $new_version);
+      $make_count++;
+    } elsif ($rounds == 2) {
+      lwarn "cannot create new version symlink '$new_version'\n";
     } else {
-      lwarn "cannot read symlink '$prevversion' -- cannot create fake\n";
+      lprint "cannot create new version symlink '$new_version'\n";
     }
+    $log_nr--;
   }
+  lwarn "cannot create faked versionlink\n" if !$make_count;
 }
 
 sub _set_replaylink {
-  my ($basedir, $replay, $primary) = @_;
-  my $replaylink = "$basedir/replay-$host";
-  my $oldreplay = readlink($replaylink);
-  # fake old version symlink when necessary
-  if ($oldreplay) {
-    my $oldbase = $oldreplay;
-    my $base = $replay;
-    $oldbase =~ s/^([^,]+).*/$1/;
-    $base =~ s/^([^,]+).*/$1/;
-    if ($base ne $oldbase) {
-      _fake_versionlink($basedir, $oldreplay, $primary);
+  my ($basedir, $log_nr, $primary, $msg) = @_;
+  $msg = " -- THIS IS EXTREMELY RISKY -- any inconsistencies are on your own!" unless defined($msg);
+  ldie "no designated primary defined\n" unless ($primary && $primary ne "(none)");
+  my $rep_path = "$basedir/replay-$host";
+  my $rep_val  = sprintf("log-%09d-$primary,0,0", $log_nr);
+  lprint "creating new replaylink '$rep_path' -> '$rep_val'\n";
+  set_link($rep_val, $rep_path);
+
+  if ($log_nr > 1) {
+    _fake_versionlink($basedir, $log_nr - 1, $primary);
+  } else {
+    my $initial;
+    for (;;) {
+      $initial = get_link("$basedir/version-000000001-$primary", 1);
+      last if $initial;
+      sleep_timeout();
     }
+    set_link($initial, "$basedir/version-000000001-$host");
   }
-  # copy pervious version symlink
-  _fake_versionlink($basedir, $replay, $primary);
-  # create replay symlink
-  symlink($replay, "$replaylink.tmp") or ldie "cannot create replay status\n";
-  system("mv $replaylink.tmp $replaylink");
+  set_link("$log_nr$msg", "$basedir/skip-check-$host");
+}
+
+##################################################################
+
+# lowlevel tools
+
+sub lowlevel_ls_host_ips {
+  my ($cmd) = @_;
+  for my $path (glob("$mars/ips/ip-*")) {
+    $path =~ m:/ip-(.*):;
+    my $peer = $1;
+    my $ip = get_link($path, 1);
+    lprint "$peer $ip\n";
+  }
+}
+
+sub lowlevel_set_host_ip {
+  my ($cmd, $peer, $ip) = @_;
+  check_id($peer);
+  my $path = "$mars/ips/ip-$peer";
+  my $old = get_link($path, 2) || "";
+  lprint "Set host '$peer' IP from '$old' to '$ip'\n";
+  set_link($ip, $path);
+}
+
+sub lowlevel_delete_host {
+  my ($cmd, $peer) = @_;
+  check_id($peer, 1);
+  my $path = "$mars/ips/ip-$peer";
+  my $old = get_link($path);
+  lprint "Removing host '$peer' old IP '$old'\n";
+  _create_delete($path);
 }
 
 ##################################################################
@@ -411,42 +1461,123 @@ sub _set_replaylink {
 sub ignore_cmd {
   my ($cmd, $res) = @_;
   lprint "ignoring command '$cmd' on resource '$res'\n";
-  exit(0);
 }
 
 sub senseless_cmd {
   my ($cmd, $res) = @_;
-  lprint "command '$cmd' makes no sense with MARS (ignoring)\n";
-  exit(0);
+  lprint "command '$cmd' makes no sense with MARS (ignoring on resource '$res')\n";
 }
 
 sub forbidden_cmd {
   my ($cmd, $res) = @_;
-  ldie "command '$cmd' cannot be used with MARS (it is impossible to carry out uniquely and could therefore lead to a disaster)\n";
+  ldie "command '$cmd' on resource '$res' cannot be used with MARS (migth affect too many hosts, lead to undesired consequences)\n";
 }
 
 sub nyi_cmd {
   my ($cmd, $res) = @_;
-  ldie "command '$cmd' is not yet implemented\n";
+  ldie "command '$cmd'  on resource '$res' is not yet implemented\n";
 }
 
 sub is_module_loaded {
-  open TEST, "lsmod | grep mars |";
-  my $res = <TEST>;
-  close TEST;
-  return $res;
+  return -d "/proc/sys/mars";
+}
+
+sub set_connect_pref_list {
+  my ($cmd, $res, $list) = @_;
+  check_res_member($cmd, $res);
+  my $dst = "$mars/resource-$res/connect-$host";
+  if ($cmd =~ m/^get-/) {
+    my $value = get_link($dst);
+    lprint "$value\n";
+    return;
+  }
+  check_id_list($list, 1);
+  set_link($list, $dst);
+}
+
+sub emergency_limit_res {
+  my ($cmd, $res, $value) = @_;
+  my $dst = "$mars/resource-$res/todo-$host/emergency-limit";
+  if ($cmd =~ m/^get-/) {
+    my $value = get_link($dst);
+    lprint "$value\n";
+    return;
+  }
+  ldie "percent argument '$value' isn't numeric\n" unless $value =~ m/^[0-9]+$/;
+  ldie "percent argument '$value' isn't between 0 and 100%\n" unless ($value >= 0 && $value <= 100);
+  set_link($value, $dst);
+}
+
+sub set_link_cmd {
+  my $cmd = shift;
+  for (;;) {
+    my $src = shift || last;
+    if ($cmd =~ m/^get-/) {
+      my $value = get_link($src);
+      lprint "$value\n";
+      next;
+    }
+    my $dst = shift || ldie "you did not supply a symlink destination for source '$src'\n";
+    ldie "symlink target '$dst' is not an absolute path\n" unless $dst =~ m:^/:;
+    check_userspace($dst);
+    my $dir = `dirname "$dst"` or ldie "path '$dst' has no dirname\n";
+    chomp $dir;
+    ldie "directory '$dir' does not exist\n" unless -d $dir;
+    set_link($src, $dst);
+  }
+}
+
+sub set_sync_pref_list {
+  my ($cmd, $list) = @_;
+  my $todo_dir = "$mars/defaults-$host";
+  ldie "directory '$todo_dir' does not exist\n" unless -d $todo_dir;
+  my $dst = "$todo_dir/sync-pref-list";
+  if ($cmd =~ m/^get-/) {
+    my $value = get_link($dst);
+    lprint "$value\n";
+    return;
+  }
+  set_link($list, $dst);
+}
+
+sub set_sync_limit_value {
+  my ($cmd, $value) = @_;
+  my $todo_dir = "$mars/defaults-$host";
+  ldie "directory '$todo_dir' does not exist\n" unless -d $todo_dir;
+  my $dst = "$todo_dir/sync-limit";
+  if ($cmd =~ m/^get-/) {
+    my $value = get_link($dst);
+    lprint "$value\n";
+    return;
+  }
+  set_link($value, $dst);
+}
+
+sub create_uuid {
+  my ($cmd) = @_;
+  my $old_uuid = get_link("$mars/uuid", 2);
+  ldie "Cluster was already created with uuid='$old_uuid'. " .
+    "For safety reasons, no override is possible at marsadm level.\n" if $old_uuid;
+  my $uuid = `echo -n \$(hostname) \$(date)`;
+  set_link($uuid, "$mars/uuid");
+  finish_links(); # opportunity for errors => don't continue
+  lprint "New cluster UUID is '$uuid'\n";
 }
 
 sub _create_cluster {
   my ($cmd) = @_;
-  system("mkdir $mars") unless -d $mars;
+  ldie "The $mars directory does not exist.\n" unless -d $mars;
+  create_uuid(@_) if $cmd eq "create-cluster";
   system("mkdir $mars/ips") unless -d "$mars/ips";
   system("mkdir $mars/userspace") unless -d "$mars/userspace";
   system("mkdir $mars/defaults") unless -d "$mars/defaults";
   system("mkdir $mars/defaults-$host") unless -d "$mars/defaults-$host";
+  set_link("0", "$mars/defaults-$host/sync-limit");
+  set_link("(none)", "$mars/defaults-$host/sync-pref-list");
   system("mkdir $mars/todo-global") unless -d "$mars/todo-global";
-  symlink($ip, "$mars/ips/ip-$host");
-  symlink("1", "$mars/todo-global/deleted-$host");
+  mkdir("$mars/actual-$host") unless -d "$mars/actual-$host";
+  set_link($ip, "$mars/ips/ip-$host");
+  set_link("1", "$mars/todo-global/deleted-$host");
 }
 
 sub create_cluster {
@@ -456,214 +1587,456 @@ sub create_cluster {
   _create_cluster(@_);
 }
 
+sub _run_rsync {
+  my ($cmd) = @_;
+  my $cycle = 0;
+  my $status = 0;
+  # Repeat the action because some symlinks might be updated (or even vanish)
+  # when the peer is actively running. There seems to exist no rsync option
+  # for ignoring all of these errors.
+  do {
+    $status = system($cmd);
+  } while ($status != 0 && $status != 24 && $cycle++ < 3);
+  ldie "Cannot get remote symlink tree via rsync, status=$status\n" if ($status && $status != 24);
+}
+
 sub join_cluster {
   my ($cmd, $peer) = @_;
-  if(glob("$mars/resource-*") or glob("$mars/ips/*")) {
+  ldie "Cannot join myself (peer='$peer', host='$host')\n" if $peer eq $host;
+  ldie "Directory $mars is missing\n" unless -d $mars;
+  ldie "A valid tree signature '$mars/tree-$host' already exists, thus it appears you are already a cluster member! This cannot be overridden, other by using a freshly created /mars/ filesystem.\n" if -l "$mars/tree-$host";
+  ldie "A cluster UUD '$mars/uuid' already exists, thus it appears you are already a cluster member! This cannot be overridden, other by using a freshly created /mars/ filesystem.\n" if -l "$mars/uuid";
+  if (glob("$mars/resource-*") or glob("$mars/ips/*")) {
     ldie "Sorry, some resources already exist!\nThis is dangerous!\nIf you are sure that no resource clash is possible, re-invoke this command with '--force' option\n" unless $force;
   }
   ldie "mars module is loaded, please unload first\n" if is_module_loaded();
   lprint "joining cluster via rsync (peer='$peer')\n";
   # check connection
   system("ssh $peer uname -a") == 0 or ldie "oops, no connection to $peer ...\n";
+  unless ($dry_run) {
+    _run_rsync("rsync --recursive --links --max-size=1 -v $peer:$mars/ $mars/");
+  }
+  # check uniqness of IPs
+  foreach my $other_ip_path (glob("$mars/ips/*")) {
+    my $other_ip = get_link($other_ip_path, 1);
+    ldie "New IP '$ip' already exists at '$other_ip_path'\n" if $ip eq $other_ip;
+  }
   _create_cluster(@_);
-  system("rsync --recursive --links -v $peer:$mars/ips/ $mars/ips/") == 0 or ldie "oops\n";
-  symlink($ip, "$mars/ips/ip-$host");
-  system("rsync --recursive --links -v $mars/ips/ $peer:$mars/ips/") == 0 or ldie "oops\n";
+  finish_links();
+  unless ($dry_run) {
+    _run_rsync("rsync --recursive --links -v $mars/ips/ $peer:$mars/ips/");
+  }
 }
 
 sub leave_cluster {
   my ($cmd) = @_;
-  my $check = "/mars/resource-*/*-$host";
+  ldie "mars kernel module is not loaded. This is needed for communication with some other hosts!\n" if !is_module_loaded();
+  my $check = "/mars/resource-*/data-$host";
   ldie "I am member of some resources\n" if glob($check) && !$force;
-  _create_delete("$mars/ips/$host");
+  wait_cluster($cmd) unless $force;
+  foreach my $path (glob("$mars/actual-*/*-$host")) {
+    _create_delete($path);
+  }
+  _create_delete("$mars/ips/ip-$host");
+  finish_links();
+  wait_cluster($cmd) unless $force;
+  foreach my $path (glob("$mars/actual-*/*-$host")) {
+    _create_delete($path);
+  }
+  _create_delete("$mars/todo-global/deleted-$host");
+  finish_links();
+  wait_cluster($cmd) unless $force;
+  while (-f "$mars/ips/ip-$host" && $timeout >= 0) {
+    sleep_timeout(3, 1);
+  }
+  system("rmmod mars") if $host eq $real_host;
+  foreach my $path (glob("$mars/{,resource-*/}{todo,actual}-*/*-$host")) {
+    unlink($path);
+  }
+  foreach my $path (glob("$mars/{,resource-*/}{todo,actual}-$host")) {
+    rmdir($path); # at least try it
+  }
 }
 
 sub create_res {
-  my ($cmd, $res, $dev, $appear) = @_;
+  my ($cmd, $res, $dev, $appear, $size_arg) = @_;
   my $create = ($cmd eq "create-resource");
 
   ldie "undefined device or size argument\n" unless $dev;
   $appear = $res if !$appear;
   check_id($appear) if $appear;
 
-  if($create) {
-    ldie "resource '$res' already exists\n" if -d "$mars/resource-$res";
+  my $resdir = "$mars/resource-$res";
+  if ($create) {
+    if (-d $resdir) {
+      lwarn "resource directory '$res' already exists\n";
+      my @host_list = glob("$resdir/replay-*");
+      if (@host_list) {
+	my $h_list = join(',', map({ $_ =~ s:.*/replay-::;} (@host_list)));
+	lwarn "DANGER: hosts '$h_list' are already member of resource '$res'.\n";
+	ldie "REFUSING to trash your resource!\n" unless $force;
+      }
+    }
     lprint "creating new resource '$res'\n";
   } else {
-    ldie "resource '$res' has been already joined -- this is dangerous!\n" if -e "$mars/resource-$res/connect-$host";
-    lprint "joining to existing resource '$res'\n";
+    if ( -l "$resdir/data-$host") {
+      lwarn "resource '$res' has been already joined -- this is dangerous!\n";
+      ldie "refusing dangerous operation\n" unless $force;
+    } else {
+      lprint "joining to existing resource '$res'\n";
+    }
   }
 
-  my $size = get_size($dev);
-  if($size > 0) {
-    $dev = "";
-  } else {
-    ldie "block device '$dev' does not exist\n" unless -b $dev;
+  my $size = 0;
+  if (-b $dev) {
     ldie "block device '$dev' must be an absolute path starting with '/'\n" unless $dev =~ m/^\//;
-    use Fcntl 'SEEK_END';
-    open(TEST, "<$dev") or ldie "cannot open device for reading\n";
+    use Fcntl 'SEEK_END', 'O_RDONLY', 'O_RDWR', 'O_EXCL';
+    my $flags = O_RDWR | O_EXCL;
+    if ($force) {
+      $flags = O_RDONLY;
+    }
+    sysopen(TEST, $dev, $flags) or ldie "cannot open device '$dev' for exclusive rw access\n";
     $size = sysseek(TEST, 0, SEEK_END);
     close(TEST);
-    lprint "device size = $size bytes\n";
-    ldie "implausible size $size" unless $size > 0;
-  }
-
-  my $tmp = "$mars/.tmp.$res";
-  my $primary;
-  my $replay;
-  if($create) {
-    _create_cluster(@_);
-    system("rm -rf $tmp");
-    system("mkdir $tmp") == 0 or ldie "could not create resource '$res'\n";
-    symlink($size, "$tmp/size") or ldie "cannot create size indicator symlink\n";
+    lprint "block device '$dev': determined size = $size bytes\n";
+    if ($size_arg) {
+      my $new_size = get_size($size_arg);
+      ldie "size argument '$size_arg' is smaller than device size '$size'\n" unless $new_size <= $size;
+      lprint "reducing size from $size to $new_size\n";
+      $size = $new_size;
+    }
   } else {
-    $tmp = "$mars/resource-$res";
-    ldie "resource '$res' does not exist\n" unless -d $tmp;
-    $primary = readlink("$tmp/primary") or ldie "cannot determine primary\n";
-    if($primary eq "(none)") {
-      my @list = glob("$tmp/replay-*") or ldie "cannot find any candidate for primary\n";
-      my $first = pop @list or ldie "bad glob list\n";
-      $primary = readlink($first) or ldie "cannot determine peer\n";
-      $primary =~ s/^log-[0-9]+-(.*),.*,.*$/$1/;
-      lprint "using '$primary' as primary\n";
+    $size = get_size($dev);
+    if ($size > 0) {
+      $dev = "";
+    } else {
+      ldie "bad parameter '$dev': must be either a block device name, or size followed by k or m or g or t\n";
     }
-    ldie "resource '$res' is already joined\n" if -e "$tmp/data-$host";
-    ldie "my ip '$ip' is not registered -- please run 'join-cluster' first\n" unless -l "$mars/ips/ip-$host";
-    my $oldsize = readlink("$tmp/size") or ldie "cannot determine old size\n";
-    if($size < $oldsize) {
-      lprint "adjusting size to $oldsize\n";
-      $size = $oldsize;
-    }
-    ldie "sizes differ: real size = $oldsize, but requested size = $size\n" unless $oldsize == $size;
-    $replay = readlink("$tmp/replay-$primary") or ldie "cannot read replay status of primary '$primary'\n";
-    $replay =~ s/,[0-9]+,[0-9]+$/,0,0/;
   }
 
-  my $file = "$tmp/data-$host";
-  if(!$dev) {
-    lprint "creating sparse file '$file' with size $size\n";
-    open(OUT, ">$file") or ldie "could not open '$file'\n";
-    use Fcntl 'SEEK_SET';
-    sysseek(OUT, $size-1, SEEK_SET) == $size-1 or ldie "could not seek\n";
-    syswrite(OUT, '\0', 1) == 1 or ldie "cannot init sparse file\n";
+  ldie "implausible size $size" unless $size > 4096 * 16; # smaller floppies should not exist ;)
+
+  my $primary;
+  my $replay_nr = -1;
+  if ($create) {
+    mkdir($resdir);
+    ldie "could not create resource '$res'\n" unless -d $resdir;
+    set_link($size, "$resdir/size");
+  } else { # join
+    ldie "resource '$res' does not exist\n" unless -d $resdir;
+    my $res_size = get_link("$mars/resource-$res/size");
+    if ($size < $res_size) {
+      lwarn "size of new device is only $size, but should be $res_size\n";
+      ldie "refusing to join due to bad size\n" unless $force;
+    } elsif ($size > $res_size) {
+      lprint "Your physical device has size $size, which is larger than the logical resource size $res_size.\n";
+      lprint "This does no harm, but you are wasting some space.\n";
+    }
+    $primary = _get_designated_primary($res);
+    ldie "Sorry, joining is only possible if a designated primary exists.\n" if $primary eq "(none)";
+    ldie "implausible state: I ($host) am already designated primary of resource '$res' which I just wanted to join\n" if $primary eq $host;
+    ldie "my ip '$ip' is not registered -- please run 'join-cluster' first\n" unless -l "$mars/ips/ip-$host";
+    check_sync_startable(@_);
+    my $replay = get_link("$resdir/replay-$primary");
+    if ($replay =~ m/^log-([0-9]+)-/) {
+      $replay_nr = $1;
+    } else {
+      ldie "cannot determine current logfile number.\n";
+    }
+  }
+
+  # check for uniqeness of $appear
+  if ($appear) {
+    foreach my $old_dev (glob("$mars/resource-*/device-$host")) {
+      $old_dev =~ m:/resource-([^/]+)/:;
+      next unless defined($1);
+      my $old_res = $1;
+      next if $old_res eq $res;
+      my $old_name = get_link($old_dev);
+      if ($old_name eq $appear) {
+	if ( -l "$mars/resource-$old_res/data-$host") {
+	  ldie "device '/dev/mars/$old_name' is already present in joined resource '$old_res'\n";
+	} else {
+	  lwarn "device '/dev/mars/$old_name' is already present in another unjoined resource '$old_res' -- this does no harm, but may be confusing.\n";
+	}
+      }
+    }
+    # warn if devices are named differently throughout the cluster
+    foreach my $old_dev (glob("$resdir/device-*")) {
+      my $old_name = get_link($old_dev);
+      if ($old_name ne $appear) {
+	$old_dev =~ m:/device-(.+)$:;
+	my $old_host = $1;
+	lwarn "your name '/dev/mars/$appear' differs from '/dev/mars/$old_name' on host '$old_host'.";
+	lwarn "this does no harm, but may be confusing.";
+      }
+    }
+  }
+
+  # check for remains from former incidents
+  foreach my $remain (glob("$resdir/{log,version}-*-$host")) {
+    if (!$create) {
+      $remain =~ m/-([0-9]+)-$host/;
+      my $nr = $1;
+      next if $nr < $replay_nr;
+    }
+    lwarn "Resource directory has some old remains like '$remain'.\n";
+    lwarn "First cleanup.\n";
+    my $extra_op = $create ? "delete-resource" : "log-purge-all";
+    lwarn "If you really want to $cmd, run 'marsadm $extra_op' first.\n";
+    ldie "REFUSING $cmd\n" unless $force;
+  }
+
+  my $file = "$resdir/data-$host";
+  if (!$dev) {
+    lwarn "file '$file' already exists - reusing\n" if -l $file;
+    lprint "setup sparse file '$file' with size $size\n";
+    open(OUT, ">>", $file) or ldie "could not open '$file'\n";
+    truncate(OUT, $size) or ldie "truncate to size $size failed\n";
     close OUT;
   } else {
     lprint "using existing device '$dev'\n";
-    symlink($dev, $file) or ldie "cannot create device symlink\n";
+    set_link($dev, $file);
   }
-  if($appear) {
-    # TODO: check for uniqeness of $appear
+
+  if ($appear) {
     lprint "resource '$res' will appear as local device '/dev/mars/$appear'\n";
-    system("rm -f $tmp/device-$host");
-    symlink($appear, "$tmp/device-$host") or ldie "cannot create symlink for local device appearance\n";
+    set_link($appear, "$resdir/device-$host");
   }
 
-  mkdir("$tmp/userspace") unless -d "$tmp/userspace";
-  mkdir("$tmp/defaults") unless -d "$tmp/defaults";
-  mkdir("$tmp/defaults-$host");
-  mkdir("$tmp/actual-$host");
-  my $todo = "$tmp/todo-$host";
+  mkdir("$resdir/userspace") unless -d "$resdir/userspace";
+  mkdir("$resdir/defaults") unless -d "$resdir/defaults";
+  mkdir("$resdir/defaults-$host");
+  mkdir("$resdir/local-$host");
+  mkdir("$resdir/actual-$host");
+  my $todo = "$resdir/todo-$host";
   mkdir($todo);
-  symlink("1", "$todo/attach");
-  symlink("1", "$todo/connect");
-  symlink("1", "$todo/sync");
-  symlink("1", "$todo/allow-replay");
-  system("rm -f $tmp/syncstatus-$host");
+  set_link("1", "$todo/attach");
+  set_link("1", "$todo/connect");
+  set_link("1", "$todo/sync");
+  set_link("1", "$todo/allow-replay");
+  unlink("$resdir/syncstatus-$host");
 
-  if($create) {
-    symlink($host, "$tmp/primary") or ldie "cannot create primary symlink\n";
-    symlink($size, "$tmp/syncstatus-$host") or ldie "cannot create primary syncstatus\n";
-    symlink("log-000000001-$host,0,0", "$tmp/replay-$host") or ldie "cannot create replay status\n";
-    system("touch $tmp/log-000000001-$host");
-    rename($tmp, "$mars/resource-$res") or ldie "cannot finalize resource '$res'\n";
+  if ($create) {
+    set_link($host, "$resdir/primary");
+    set_link($size, "$resdir/syncstatus-$host");
+    my $startnr = get_link("$resdir/maxnr", 2);
+    if (defined($startnr) && $startnr ne "" && $startnr > 0) {
+      $startnr += 1000;
+    } else {
+      $startnr = 1;
+    }
+    my $fmt_old = sprintf("%09d", $startnr - 1);
+    my $fmt = sprintf("%09d", $startnr);
+    set_link("log-$fmt-$host,0,0", "$resdir/replay-$host");
+    system("touch $resdir/log-$fmt-$host") unless $dry_run;
+    my $old_fake = "00000000000000000000000000000000,log-$fmt_old-$host,0";
+    set_link("$old_fake:", "$resdir/version-$fmt_old-$host");
+    set_link("00000000000000000000000000000000,log-$fmt-$host,0:$old_fake", "$resdir/version-$fmt-$host");
+    set_link("$startnr", "$resdir/skip-check-$host") if $startnr > 1;
+    set_link("$startnr", "$resdir/maxnr");
+    finish_links();
     lprint "successfully created resource '$res'\n";
   } else {
-    _set_replaylink($tmp, $replay, $primary);
-    symlink("0", "$tmp/syncstatus-$host") or ldie "cannot start initial sync\n";
-    system("rm -f $tmp/connect-$host");
-    symlink($primary, "$tmp/connect-$host") or ldie "cannot create peer connect symlink\n";
-    symlink($host, "$tmp/connect-$primary") unless -l "$tmp/connect-$primary";
+    _set_replaylink($resdir, $replay_nr, $primary, "");
+    set_link("0", "$resdir/syncstatus-$host");
+    finish_links();
     lprint "successfully joined resource '$res'\n";
   }
 }
 
-sub leave_res {
+sub leave_res_phase0 {
   my ($cmd, $res) = @_;
-  check_not_primary(@_);
+  check_not_primary(@_) unless $force;
+  my $errors = 0;
   foreach my $tmp (glob("$mars/resource-$res/todo-$host/*")) {
-    my $status = readlink($tmp);
-    ldie "cannot read symlink '$tmp'\n" unless defined($status);
-    ldie "switch '$tmp' is not off\n" if $status;
+    my $status = get_link($tmp, 2);
+    if ($status) {
+      lwarn "switch '$tmp' is not off\n";
+      $errors++;
+    }
   }
-  foreach my $tmp (glob("$mars/resource-$res/actual-$host/*")) {
-    my $status = readlink($tmp);
-    ldie "cannot read symlink '$tmp'\n" unless defined($status);
-    ldie "running status '$tmp' is not off\n" if $status;
+  foreach my $tmp (glob("$mars/resource-$res/actual-$host/{is-,logfile-}*")) {
+    my $status = get_link($tmp);
+    if ($status) {
+      lwarn "running status '$tmp' is not off\n";
+      $errors++;
+    }
   }
-  my $peerlink = "$mars/resource-$res/connect-$host";
-  my $peer = readlink($peerlink) or ldie "cannot read symlink '$peerlink'\n";
-  foreach my $tmp (glob("$mars/resource-$res/connect-*")) {
-    next if $tmp eq $peerlink;
-    my $target = readlink($tmp) or ldie "cannot read symlink '$tmp'\n";
-    next unless $target eq $host;
-    lprint "changing '$tmp' from '$host' to '$peer'\n";
-    unlink("$tmp.new");
-    symlink($peer, "$tmp.new") or ldie "cannot create symlink '$tmp.new'\n";
-    rename("$tmp.new", $tmp) or ldie "cannot create symlink '$tmp'\n";
+  if (!$force) {
+    check_status($cmd, $res, "is-attached", 0, 0, 1);
+    ldie "there were $errors errors.\n" if $errors;
   }
-  unlink($peerlink);
+}
+
+sub leave_res_phase1 {
+  my ($cmd, $res) = @_;
+  _create_delete("$mars/resource-$res/replay-$host");
+  _create_delete("$mars/resource-$res/data-$host");
+  _create_delete("$mars/resource-$res/syncstatus-$host");
+  my $syncpos = "$mars/resource-$res/syncpos-$host";
+  _create_delete($syncpos) if -l $syncpos;
+  my $skip_check = "$mars/resource-$res/skip-check-$host";
+  _create_delete($skip_check) if -l $skip_check;
+  my $vstatus = "$mars/resource-$res/verifystatus-$host";
+  _create_delete($vstatus) if -l $vstatus;
+  _create_delete("$mars/resource-$res/device-$host");
+  _create_delete("$mars/resource-$res/actsize-$host");
+  foreach my $dir (glob("$mars/resource-$res/*-$host/")) {
+    foreach my $tmp (glob("${dir}*")) {
+      _create_delete($tmp);
+    }
+    _create_delete($dir);
+  }
+  finish_links();
+}
+
+# wait for deletions (avoid races with following commands)
+sub leave_res_phase2 {
+  my ($cmd, $res) = @_;
+  _wait_delete();
+  $force = 0; # this would be too dangerous
+  log_purge_res(@_);
+  finish_links();
+  _wait_delete();
+  system("rm -f $mars/resource-$res/log-*") if $host eq $real_host;
+}
+
+sub delete_res {
+  my ($cmd, $res) = @_;
+  my $basedir = "$mars/resource-$res";
+  # preconditions
+  if (! -d $basedir) {
+    lprint "resource directory '$basedir' does no longer exist.\n";
+    return;
+  }
+  my @host_list = glob("$basedir/replay-*");
+  my $cnt = scalar(@host_list);
+  if ($cnt > 0) {
+    my $h_list = join(',', map({ $_ =~ s:.*/replay-::;} (@host_list)));
+    ldie "resource '$res' is not empty: first remove the hosts '$h_list' via leave-resource\n" unless $force;
+    lwarn "BRUTE FORCE resource destruction: '$res' has $cnt members ($h_list) THESE ARE FINALLY TRASHED right now -- you are RESPONSIBLE for any subsequent problems.\n";
+  }
+  for my $path (`find $basedir/* | sort -r`) {
+    chomp $path;
+    next if $path =~ m:/(maxnr$|\.deleted-):;
+    _create_delete($path);
+  }
+  finish_links();
+  _wait_delete();
 }
 
 sub logrotate_res {
   my ($cmd, $res) = @_;
-  check_primary(@_);
+  check_primary(@_) unless $force;
   my @paths = glob("$mars/resource-$res/log-*-$host") or ldie "cannot find any logfiles\n";
   @paths = sort(@paths);
   my $last = pop(@paths);
-  if(-z $last) {
-    lprint "an empty logfile '$last' already exists, nothing to do.\n";
+  if (-z $last) {
+    lprint "an empty logfile '$last' already exists, nothing to do.\n" if $verbose;
     return;
   }
   my $nr = $last;
   $nr =~ s/^.*log-([0-9]+)-.+$/$1/;
   my $next = sprintf("$mars/resource-$res/log-%09d-$host", $nr + 1);
   ldie "logfile '$next' already exists\n" if -e $next;
-  system("touch $next");
+  system("touch $next") unless $dry_run;
+  my $startnr = get_link("$mars/resource-$res/maxnr", 1);
+  $startnr = $nr + 1 if ($nr >= $startnr);
+  set_link("$startnr", "$mars/resource-$res/maxnr");
 }
 
-sub _allowed_logdelete {
+sub _get_deletable_logfiles {
   my ($cmd, $res) = @_;
   my $min = -1;
+  my $max = -1;
+  my @log_paths = glob("$mars/resource-$res/log-*") or ldie "cannot find any logfiles\n";
+  foreach my $path (@log_paths) {
+    $path =~ m/\/log-([0-9]+)-/;
+    my $nr = $1;
+    $min = $nr if ($nr < $min || $min < 0);
+    $max = $nr if ($nr > $max || $max < 0);
+  }
   my @paths = glob("$mars/resource-$res/replay-*") or ldie "cannot find any replay symlinks\n";
   foreach my $path (@paths) {
-    my $target = readlink($path) or ldie "cannot read symlink '$path'\n";
-    my $nr = $target;
-    $nr =~ s/^log-([0-9]+)-.*$/$1/;
-    $min = $nr if ($nr < $min || $min < 0);
+    my $target = get_link($path);
+    $target =~ m/^log-([0-9]+)/;
+    my $nr = $1;
+    $max = $nr if ($nr < $max || $max < 0);
   }
-  lprint "max allowed deletable logfile number: $min\n";
-  return $min;
+  return ($min, $max);
 }
+
+my $delete_nr = -1;
 
 sub _create_delete {
   my ($target) = @_;
-  my $nr = 0;
-  my @paths = glob("$mars/todo-global/delete-*");
-  if(@paths) {
-    my $last = pop(@paths);
-    $nr = $last;
-    $nr =~ s/^.*delete-([0-9]+)$/$1/;
+  ldie "cannot delete: '$target' is no absolute path\n" unless $target =~ m:^/:;
+  if ($delete_nr < 0) { # compute only upon first call
+    my @paths = glob("$mars/todo-global/delete-*");
+    foreach my $path (@paths) {
+      $path =~ m/-([0-9]+)/;
+      if (defined($1) && $1 > $delete_nr) {
+	$delete_nr = $1;
+      }
+    }
+    my @paths2 = glob("$mars/todo-global/deleted-*");
+    foreach my $path (@paths2) {
+      my $link = get_link($path, 1);
+      $link =~ m/([0-9]+)/;
+      if (defined($1) && $1 > $delete_nr) {
+	$delete_nr = $1;
+      }
+    }
   }
-  my $new = sprintf("$mars/todo-global/delete-%09d", $nr + 1);
-  lprint "create symlink $new -> $target\n";
-  symlink($target, $new);
+  my $new = sprintf("$mars/todo-global/delete-%09d-$real_host", ++$delete_nr);
+  lprint "create symlink $new -> $target\n" if $verbose;
+  set_link($target, $new);
+}
+
+sub _wait_delete {
+  return if $dry_run;
+  for (;;) {
+    my $deleted = get_link("$mars/todo-global/deleted-$real_host");
+print "deleted: $deleted / $delete_nr\n";
+    last if $deleted >= $delete_nr;
+    lprint "waiting for deletions to apply locally....\n";
+    sleep_timeout();
+  }
+  sleep(3);
+}
+
+sub delete_file_cmd {
+  my $cmd = shift;
+  my $res = shift; # ignore this
+  foreach my $path (@_) {
+    check_userspace($path);
+    _create_delete($path);
+  }
 }
 
 sub logdelete_res {
   my ($cmd, $res) = @_;
+  lprint "removing left-over .deleted symlinks...\n" if $verbose;
+  my $start_time = mars_time();
+  foreach my $leftlink (glob("$mars/{,resource-$res/}{,*/}.deleted-*")) {
+    my $stamp = get_link_stamp($leftlink);
+    next unless $stamp + 3600 * 24 < $start_time;
+    lprint "  unlink '$leftlink'\n" if $verbose;
+    unlink($leftlink);
+  }
   my @paths = glob("$mars/resource-$res/log-*") or ldie "cannot find any logfiles\n";
   @paths = sort(@paths);
-  my $max = _allowed_logdelete(@_);
+  my ($min_deletable, $max_deletable) = _get_deletable_logfiles(@_);
+  lprint "min     deletable logfile number: $min_deletable\n" if $verbose;
+  lprint "min non-deletable logfile number: $max_deletable\n" if $verbose;
+  if ($min_deletable >= $max_deletable) {
+    lprint "no logfiles are deletable.\n" if $verbose;
+    return;
+  }
+  if ($cmd ne "log-delete-all") {
+    $max_deletable = $min_deletable + 1; # delete only the first one
+  }
 
   my $nr = 0;
   for (;;) {
@@ -671,47 +2044,75 @@ sub logdelete_res {
     last unless $first;
     $nr = $first;
     $nr =~ s/^.*log-([0-9]+)-.+$/$1/;
-    last unless $nr < $max;
+    next unless $nr < $max_deletable;
 
-    lprint "chosen '$first' for deletion\n";
+    lprint "chosen '$first' for deletion\n" if $verbose;
 
     _create_delete($first);
   }
-  lprint "removing left-over version symlinks...\n";
+  lprint "removing left-over version symlinks...\n" if $verbose;
   foreach my $versionlink (glob("$mars/resource-$res/version-*")) {
     my $nrv = $versionlink;
     $nrv =~ s/^.*\/version-([0-9]+)-.+$/$1/;
-    next unless $nrv < $max - 1;
+    # we need at least one more version link than logfiles for consistency checks
+    next unless $nrv < $max_deletable - 1;
     _create_delete($versionlink);
   }
 }
 
-sub attach_res {
+sub attach_res_phase0 {
+  my ($cmd, $res) = @_;
+  return if $force;
+  my $detach = ($cmd eq "detach");
+  if ($detach) {
+    my $device_in_use = get_link("$mars/resource-$res/actual-$host/open-count", 1);
+    if ($device_in_use) {
+      my $name = get_link("$mars/resource-$res/device-$host");
+      my $dev = "/dev/mars/$name";
+      ldie "device '$dev' is in use\n";
+    }
+  }
+}
+
+sub attach_res_phase1 {
   my ($cmd, $res) = @_;
   my $detach = ($cmd eq "detach");
   my $path = "$mars/resource-$res/todo-$host/attach";
   _switch($cmd, $res, $path, !$detach);
 }
 
-sub connect_res {
+sub attach_res_phase2 {
   my ($cmd, $res) = @_;
-  my $disconnect = ($cmd eq "disconnect");
-  my @paths = glob("$mars/resource-$res/todo-*/");
-  for my $path (@paths) {
-    _switch($cmd, $res, "$path/connect", !$disconnect);
+  my $detach = ($cmd eq "detach");
+  return if $force;
+  check_status($cmd, $res, "is-attached", $detach ? 0 : 1, 1);
+  if ($detach) {
+    check_mars_device($cmd, $res, 1, 1);
+    check_status($cmd, $res, "is-replaying", 0, 1);
+    check_status($cmd, $res, "is-syncing", 0, 1);
   }
 }
 
-sub connect_local_res {
+sub fetch_global_res {
   my ($cmd, $res) = @_;
-  my $disconnect = ($cmd eq "disconnect-local");
-  my $path = "$mars/resource-$res/todo-$host/connect";
-  _switch($cmd, $res, $path, !$disconnect);
+  my $pause = ($cmd =~ m/disconnect|pause/);
+  my @paths = glob("$mars/resource-$res/todo-*/");
+  for my $path (@paths) {
+    _switch($cmd, $res, "$path/connect", !$pause);
+  }
 }
 
-sub pause_sync_res {
+sub fetch_local_res {
   my ($cmd, $res) = @_;
-  my $pause = ($cmd eq "pause-sync");
+  my $pause = ($cmd =~ m/disconnect|pause/);
+  my $path = "$mars/resource-$res/todo-$host/connect";
+  _switch($cmd, $res, $path, !$pause);
+}
+
+sub pause_sync_global_res {
+  my ($cmd, $res) = @_;
+  my $pause = ($cmd =~ m/pause/);
+  check_sync_startable(@_) if !$pause;
   my @paths = glob("$mars/resource-$res/todo-*/");
   for my $path (@paths) {
     _switch($cmd, $res, "$path/sync", !$pause);
@@ -720,190 +2121,468 @@ sub pause_sync_res {
 
 sub pause_sync_local_res {
   my ($cmd, $res) = @_;
-  my $pause = ($cmd eq "pause-sync-local");
+  my $pause = ($cmd =~ m/pause/);
+  check_sync_startable(@_) if !$pause;
   my $path = "$mars/resource-$res/todo-$host/sync";
   _switch($cmd, $res, $path, !$pause);
 }
 
-sub pause_replay_res {
+sub pause_replay_global_res {
   my ($cmd, $res) = @_;
-  my $pause = ($cmd eq "pause-replay");
+  my $pause = ($cmd =~ m/pause/);
   my @paths = glob("$mars/resource-$res/todo-*/");
   for my $path (@paths) {
-    _switch($cmd, $res, "$path/allow-replay", !$pause);
+    _switch($cmd, $res, "$path/replay", !$pause);
   }
 }
 
 sub pause_replay_local_res {
   my ($cmd, $res) = @_;
-  my $pause = ($cmd eq "pause-replay-local");
-  my $path = "$mars/resource-$res/todo-$host/allow-replay";
+  my $pause = ($cmd =~ m/pause/);
+  my $path = "$mars/resource-$res/todo-$host/replay";
   _switch($cmd, $res, $path, !$pause);
 }
 
-sub up_res {
+sub up_res_phase0 {
   my ($cmd, $res) = @_;
   my $down = ($cmd eq "down");
-  if($down) {
-    pause_replay_res("pause-replay", $res);
-    pause_sync_res("pause-sync", $res);
-    connect_res("disconnect", $res);
-    attach_res("detach", $res);
+  if ($down) {
+    attach_res_phase0("detach", $res);
   } else {
-    attach_res("attach", $res);
-    connect_res("connect", $res);
-    pause_sync_res("resume-sync", $res);
-    pause_replay_res("resume-replay", $res);
+    attach_res_phase0("attach", $res);
   }
 }
 
-sub fake_local_res {
+sub up_res_phase1 {
+  my ($cmd, $res) = @_;
+  my $down = ($cmd eq "down");
+  if ($down) {
+    pause_replay_local_res("pause-replay-local", $res);
+    pause_sync_local_res("pause-sync-local", $res);
+    fetch_local_res("pause-fetch", $res);
+    attach_res_phase1("detach", $res);
+  } else {
+    attach_res_phase1("attach", $res);
+    fetch_local_res("resume-fetch-local", $res);
+    pause_sync_local_res("resume-sync-local", $res);
+    pause_replay_local_res("resume-replay-local", $res);
+  }
+}
+
+sub up_res_phase2 {
+  my ($cmd, $res) = @_;
+  my $down = ($cmd eq "down");
+  if ($down) {
+    attach_res_phase2("detach", $res);
+  } else {
+    attach_res_phase2("attach", $res);
+  }
+}
+
+sub set_replay_res {
+  my ($cmd, $res, $new_nr) = @_;
+  if (!$new_nr || $new_nr <= 0) {
+    ldie "you must supply a numeric logfile number as third argument.\n";
+  }
+  check_not_primary(@_);
+  check_todo($cmd, $res, "replay", 0, 0);
+  my $replaylink = "$mars/resource-$res/replay-$host";
+  my $old_val = get_link($replaylink);
+  my $old_nr = $old_val;
+  $old_nr =~ s/log-([0-9]+)-.*/$1/;
+  ldie "old log number '$old_nr' is wrong\n" unless $old_nr > 0;
+  if ($new_nr > $old_nr) {
+    lwarn "you try to skip logfile numbers from $old_nr to $new_nr, are you sure?\n";
+    ldie "you would need --force if you really know what you are doing.\n" unless $force;
+  }
+  my $primary = _get_designated_primary($res);
+  _set_replaylink("$mars/resource-$res", $new_nr, $primary);
+}
+
+sub fake_sync_phase1 {
   my ($cmd, $res) = @_;
   my $path = "$mars/resource-$res/todo-$host/sync";
   _switch($cmd, $res, $path, 0);
-  #check_status($res, "copy-syncstatus-$host", 0);
-  my $size = readlink("$mars/resource-$res/size") or ldie "cannot read size\n";
+}
+
+sub fake_sync_phase2 {
+  my ($cmd, $res) = @_;
+  check_status($cmd, $res, "is-syncing", 0, 1);
+}
+
+sub fake_sync_phase3 {
+  my ($cmd, $res) = @_;
+  my $size = get_link("$mars/resource-$res/size");
   my $target = "$mars/resource-$res/syncstatus-$host";
-  symlink($size, "$target.tmp") or ldie "cannot create faked syncstatus\n";
-  rename("$target.tmp", $target) or ldie "cannot reaname symlink\n";
+  set_link($size, $target);
 }
 
 sub _primary_res {
-  my ($res, $host, $pri, $old) = @_;
-  my $tmp = "$mars/resource-$res/.tmp.primary";
-  system("rm -f $tmp");
-  symlink($host, $tmp) or ldie "cannot create new primary symlink\n";
-  rename($tmp, $pri) or ldie "cannot install new primary symlink\n";
-  lprint "primary changed from '$old' to '$host'\n";
-}
-
-sub primary_res {
-  my ($cmd, $res) = @_;
-  my $sec = ($cmd eq "secondary");
+  my ($res, $new, $old) = @_;
   my $pri = "$mars/resource-$res/primary";
-  my $old = readlink($pri) or ldie "cannot determine current primary\n";
-  if($sec) {
-    ldie "for safety reasons, switching to secondary is only allowed when I ($host) am primary\n" if($old ne $host);
-    $host = "(none)";
-  } elsif($old eq $host) {
-    lprint "I am already primary.\n";
-    exit(0);
-  } elsif($force) {
-    lprint "FORCING myself ($host) to primary...\n";
-  } else { # try to switch myself to primary
-    lprint "trying to switch $host to primary...\n";
-    check_sync_finished($res, $host);
-    check_todo($res, "connect", 1, 1);
-    _primary_res($res, "(none)", $pri, $old) unless $old eq "(none)";
-    check_primary_gone($res);
-    check_splitbrain($res, $host, -1);
-  }
-  _primary_res($res, $host, $pri, $old);
+  set_link($new, $pri);
+  lprint "designated primary changed from '$old' to '$new'\n";
 }
 
-sub invalidate_res {
+# check whether primary/secondary switching is possible at all
+sub primary_phase0 {
+  my ($cmd, $res) = @_;
+  ldie "cannot switch primary: mars kernel module is not loaded\n" unless ($cmd eq "secondary" || -d "/proc/sys/mars");
+  if ($force) {
+    check_todo($cmd, $res, "fetch", 0, 0);
+  }
+  my $old = _get_designated_primary($res);
+  lprint "Current designated primary: $old\n";
+  if ($cmd eq "primary") {
+    check_sync_finished($res, $host) if $host ne $old;
+    # also check that other secondaries won't loose their sync primary
+    my @names = glob("$mars/resource-$res/data-*");
+    # for k <= 2 replicas, the previous check must have been sufficient
+    if (scalar(@names) > 2) {
+      foreach my $name (@names) {
+	$name =~ m:/data-(.+):;
+	my $peer = $1;
+	next if ($peer eq $old || $peer eq $host);
+	check_sync_finished($res, $peer);
+      }
+    }
+    check_todo($cmd, $res, "attach", 1, 0);
+    check_todo($cmd, $res, "fetch", 1, 0) if !$force;
+    check_todo($cmd, $res, "replay", 1, 0);
+    # check that no logfile replay errors exist.
+    my $replay_error = get_link("$mars/resource-$res/actual-$host/replay-code", 2);
+    if (int($replay_error) < 0) {
+      lwarn "Logfile replay / recovery stopped with error code $replay_error.\n";
+      ldie "Won't switch to avoid unnoticed data loss. You may however do a 'primary --force'.\n" unless $force;
+    }
+  }
+  return if ($old eq $host and $cmd eq "primary");
+  return if $old eq "(none)";
+  my $open_count_path = "$mars/resource-$res/actual-$old/open-count";
+  my $device_in_use = get_link($open_count_path, 1);
+  if ($device_in_use) {
+    my $name = get_link("$mars/resource-$res/device-$old", 1) || "unknown";
+    lwarn "device '/dev/mars/$name' for resource '$res' is $device_in_use times in use on primary host '$old'\n";
+    ldie "first you must umount/close the device (on host '$old')\n" unless $force;
+    lwarn "First you SHOULD umount/close the device (on host '$old'), but you ignore this recommendation by giving the --force option.\n";
+    if (is_link_recent($open_count_path)) {
+      lwarn "You are forcing a SPLIT BRAIN via --force right now. Do you know that this is an ERRONEOUS state? Do you really know what you are doing?\n";
+    } else {
+      lwarn "You may produce a SPLIT BRAIN via --force because the peer host '$old' is currently not reachable.\n";
+    }
+  }
+  lprint "all preconditions OK for resource '$res'\n";
+}
+
+# when necessary, switch to secondary (intermediately)
+sub primary_phase1 {
+  my ($cmd, $res) = @_;
+  return if ($force and $cmd eq "primary");
+  my $old = _get_designated_primary($res);
+  return if ($old eq $host and $cmd eq "primary");
+  my $new = "(none)";
+  try_to_avoid_splitbrain($cmd, $res, $old) if (!$force and $cmd eq "primary");
+  return if $old eq $new;
+  _primary_res($res, $new, $old);
+}
+
+# when necessary, wait
+sub primary_phase2 {
+  my ($cmd, $res) = @_;
+  return if $force;
+  return unless $cmd eq "primary";
+  check_primary_gone($res);
+}
+
+# when necessary, switch to primary
+sub primary_phase3 {
+  my ($cmd, $res) = @_;
+  return unless $cmd eq "primary";
+  my $old = _get_designated_primary($res);
+  my $new = $host;
+  _primary_res($res, $new, $old);
+}
+
+# wait for device to appear / disappear
+sub primary_phase4 {
+  my ($cmd, $res) = @_;
+  if($cmd eq "secondary") {
+    check_mars_device($cmd, $res, 1, 1);
+    return;
+  }
+  my $ok = detect_splitbrain($res, 1);
+  if (!$ok) {
+    lwarn "\n";
+    lwarn "Sorry, in split brain situations I can only set the _designated_\n";
+    lwarn "primary, but I cannot _guarantee_ that becoming the\n";
+    lwarn "_actual_ primary is always possible.\n";
+    lwarn "You SHOULD resolve the split brain ASAP (e.g. by leave-resource\n";
+    lwarn "or invalidate etc).\n";
+    lwarn "\n";
+    lwarn "If you already tried to resolve the split brain manually, but\n";
+    lwarn "this message does not disappear, the reason could be some\n";
+    lwarn "hindering left-overs/remains from the former split brain.\n";
+    lwarn "ONLY in such a case, try log-purge-all --force.\n";
+    lwarn "\n";
+    return;
+  }
+  check_mars_device($cmd, $res, 1, 0);
+}
+
+sub wait_umount_res {
+  my ($cmd, $res) = @_;
+  while (1) {
+    my $sum = 0;
+    foreach my $path (glob("$mars/resource-$res/actual-$host/open-count")) {
+      $sum += get_link($path);
+    }
+    last if !$sum;
+    lprint "device for resource '$res' is $sum times in use on $host\n";
+    sleep_timeout(3);
+  }
+  lprint "OK, device for resource '$res' is not in use.\n";
+}
+
+sub invalidate_res_phase0 {
   my ($cmd, $res) = @_;
   check_not_primary(@_);
-  my $old_replay = readlink("$mars/resource-$res/replay-$host") or ldie "cannot read my own replay status symlink\n";
-  $old_replay =~ s/^([^,]+),.*/$1/;
-  my $repl = "$mars/resource-$res/todo-$host/allow-replay";
-  my $was_on = readlink($repl);
-  if ($was_on) {
-    _switch("pause-replay-local", $res, $repl, 0);
-    _trigger();
-    lprint "waiting...\n";
-    sleep(15);
-  }
-  my $dst = "$mars/resource-$res/syncstatus-$host";
-  system("rm -f $dst");
-  symlink("0", $dst) or ldie "cannot create invalidation symlink '$dst'\n";
-  my $primary = readlink("$mars/resource-$res/primary") or ldie "cannot determine primary\n";
-  my $replay = readlink("$mars/resource-$res/replay-$primary") or ldie "cannot read replay status of primary '$primary'\n";
-  $replay =~ s/,[0-9]+,[0-9]+$/,0,0/;
-  _set_replaylink("$mars/resource-$res", $replay, $primary);
-  if ($was_on) {
-    _trigger();
-    lprint "waiting...\n";
-    sleep(15);
-    _switch("resume-replay-local", $res, $repl, 1);
+  my $primary = _get_designated_primary($res);
+  ldie "for operation '$cmd', some other designated primary must exist (currently there is none)\n" if $primary eq "(none)";
+  ldie "Cannot invalidate the designated primary host '$primary'\n" if $primary eq $host;
+}
+
+sub invalidate_res_phase1 {
+  my ($cmd, $res) = @_;
+  _switch($cmd, $res, "$mars/resource-$res/todo-$host/attach", 0);
+  _switch($cmd, $res, "$mars/resource-$res/todo-$host/sync", 0);
+  _switch($cmd, $res, "$mars/resource-$res/todo-$host/fetch", 0);
+  _switch($cmd, $res, "$mars/resource-$res/todo-$host/replay", 0);
+}
+
+sub invalidate_res_phase2 {
+  my ($cmd, $res) = @_;
+  if (!$force) {
+    check_status($cmd, $res, "is-syncing", 0, 1);
+    check_status($cmd, $res, "is-fetching", 0, 1);
+    check_status($cmd, $res, "is-replaying", 0, 1);
+    check_status($cmd, $res, "is-attached", 0, 1);
   }
 }
 
-sub resize_res {
+sub invalidate_res_phase3 {
   my ($cmd, $res) = @_;
+  my $dst = "$mars/resource-$res/syncstatus-$host";
+  my $primary = _get_designated_primary($res);
+  ldie "Cannot execute 'invalidate' because noone is designated as primary.\n" if (!$primary || $primary eq "(none)");
+  ldie "Cannot invalidate the designated primary host '$primary'\n" if $primary eq $host;
+  my $replay = get_link("$mars/resource-$res/replay-$primary");
+  $replay =~ m/^log-([0-9]+)-/ or ldie "replay link '$replay' is not parsable\n";
+  my $replay_nr = $1;
+  set_link("0", $dst);
+  finish_links(); # opportunity for errors => don't continue
+  for my $vers_path (glob("$mars/resource-$res/version-*-$host")) {
+    $vers_path =~ m:/version-([0-9]+):;
+    my $this_nr = $1;
+    _create_delete($vers_path) if $this_nr >= $replay_nr;
+  }
+  _create_delete("$mars/resource-$res/replay-$host");
+  finish_links();
+  _wait_delete();
+  $force = 0; # this would be too dangerous
+  log_purge_res(@_);
+  finish_links();
+  _wait_delete();
+  _set_replaylink("$mars/resource-$res", $replay_nr, $primary, "");
+  finish_links();
+  _wait_delete();
+  _switch($cmd, $res, "$mars/resource-$res/todo-$host/attach", 1);
+  _switch($cmd, $res, "$mars/resource-$res/todo-$host/fetch", 1);
+  _switch($cmd, $res, "$mars/resource-$res/todo-$host/replay", 1);
+  finish_links();
+  my $emergency_path = "$mars/resource-$res/actual-$primary/has-emergency";
+  my $emergency = get_link($emergency_path, 1);
+  if ($emergency) {
+    lwarn "Primary '$primary' is in emergency mode. Cannot start sync.\n";
+  } else {
+    _switch($cmd, $res, "$mars/resource-$res/todo-$host/sync", 1);
+  }
+}
+
+my %resize_device_size;
+my %resize_old_size;
+my %resize_new_size;
+
+sub resize_phase0 {
+  my ($cmd, $res, $size_arg) = @_;
+  ldie "mars kernel module is not loaded. This is needed for communication with some other hosts!\n" if !is_module_loaded();
+  my $new_size = 0;
+  if ($size_arg) {
+    $new_size = get_size($size_arg);
+    ldie "optional size argument '$new_size' must be numeric and positive\n" unless scalar($new_size) > 0;
+    lprint "new size: $new_size bytes\n";
+  }
   check_primary(@_);
+  my $my_size = get_link("$mars/resource-$res/actsize-$host");
   my @actsizes = glob("$mars/resource-$res/actsize-*");
   ldie "resource $res has no actsize-* symlinks\n" unless @actsizes;
   my $lnk = "$mars/resource-$res/size";
-  my $old_size = readlink($lnk) or ldie "cannot read symlink '$lnk'\n";
-  my $min_size = 0;
+  my $old_size = get_link($lnk);
+  my $possible_size = 0;
   foreach my $actsize (@actsizes) {
-    my $this_size = readlink($actsize) or ldie "cannot read symlink '$actsize'\n";
-    if (!$min_size || $this_size < $min_size) {
-      $min_size = $this_size;
+    my $this_size = get_link($actsize);
+    if (!$possible_size || $this_size < $possible_size) {
+      $possible_size = $this_size;
     }
   }
   lprint "old_size=$old_size\n";
-  lprint "new_size=$min_size\n";
-  ldie "only increases of the size are possible\n" if $min_size <= $old_size && !$force;
-  foreach my $switch (glob("$mars/resource-$res/todo-*/sync")) {
-    my $this_switch = readlink($switch);
-    ldie "cannot read symlink '$switch'\n" unless defined($this_switch);
-    ldie "sync on '$switch' is switched on -- use marsadm pause-sync to stop\n" unless !$this_switch;
+  lprint "possible_size=$possible_size\n";
+  $new_size = $possible_size if !$new_size;
+  lprint "new_size=$new_size\n";
+  ldie "new size $new_size is higher than the possible size (minimum of all volumes) $possible_size" if $new_size > $possible_size; # no override with --force possible
+  # disallow decreasing
+  ldie "only increases of the size are possible!\n" if $new_size < $old_size;
+  my $waste = $my_size - $new_size;
+  lwarn "You are wasting $waste bytes locally\n" if $my_size > $new_size;
+  # remember values
+  $resize_device_size{$res} = _get_mars_size(@_);
+  $resize_old_size{$res} = $old_size;
+  lwarn "internal mismatch between actual device size and resource size: $resize_device_size{$res} != $resize_old_size{$res}\n" unless $resize_device_size{$res} == $resize_old_size{$res};
+  $resize_new_size{$res} = $new_size;
+  return 0;
+}
+
+sub resize_phase1 {
+  my ($cmd, $res) = @_;
+  my $old_size = $resize_old_size{$res} or ldie "bad internal size value\n";
+  my $new_size = $resize_new_size{$res} or ldie "bad internal size value\n";
+  # for safety, check again
+  ldie "only increases of the size are possible!\n" if $new_size < $old_size;
+  check_primary(@_);
+  # Mark the primary data / its size as authoritative
+  my $act_lnk = "$mars/resource-$res/syncstatus-$host";
+  set_link($new_size, $act_lnk);
+  finish_links(); # Chance for errors to pop up
+  # Now set the new resource size
+  my $lnk = "$mars/resource-$res/size";
+  set_link($new_size, $lnk);
+  finish_links();
+}
+
+sub resize_phase2 {
+  my ($cmd, $res) = @_;
+  my $old_size = $resize_old_size{$res} or ldie "bad internal size value\n";
+  my $new_size = $resize_new_size{$res} or ldie "bad internal size value\n";
+  for (;;) {
+    my $new_device_size = _get_mars_size(@_);
+    if ($new_device_size == $resize_new_size{$res}) {
+      lprint "Device size is now $new_device_size.\n";
+      last;
+    }
+    lprint "Device size $new_device_size has not yet reached the new size $resize_new_size{$res}.\n";
+    if ($new_device_size != $resize_device_size{$res}) {
+      lwarn "The size has changed, but did not reach the correct value.";
+      lwarn "Assuming some rounding problems (which may occur at some device types)\n";
+      last;
+    }
+    sleep_timeout();
   }
-  my @syncsizes = glob("$mars/resource-$res/syncstatus-$host");
-  foreach my $syncsize (@syncsizes) {
-    my $this_size = readlink($syncsize) or ldie "cannot read symlink '$syncsize'\n";
-    ldie "sync on $syncsize has not yet finished: $this_size != $old_size (DANGEROUS FIX: if you know what you are doing, marsadm fake-sync can 'fix' it -- but this may need a full-sync afterwards)\n" unless $this_size == $old_size;
-  }
-  foreach my $syncsize (@syncsizes) {
-    my $this_size = readlink($syncsize) or ldie "cannot read symlink '$syncsize'\n";
-    unlink("$syncsize.new");
-    symlink($min_size, "$syncsize.new") or ldie "cannot create size symlink '$syncsize.new'\n";
-    rename("$syncsize.new", $syncsize) or ldie "cannot create size symlink '$syncsize'\n";;
-  }
-  unlink("$lnk.new");
-  symlink($min_size, "$lnk.new") or ldie "cannot create size symlink '$lnk.new'\n";
-  rename("$lnk.new", $lnk) or ldie "cannot create size symlink '$lnk'\n";;
 }
 
 sub role_cmd {
   my ($cmd, $res) = @_;
-  my $pri = "$mars/resource-$res/primary";
-  my $old = readlink($pri) or ldie "cannot determine current primary\n";
-  if($old eq $host) {
-    lprint "primary\n";
-  } else {
-    lprint "secondary\n";
+  my $primary = _get_actual_primary($res) || '(none)';
+  my $todo_primary = _get_designated_primary($res);
+  my $msg = "I am actually ";
+  $msg .= ($primary eq $host) ? "primary" : "secondary";
+  if ($primary eq $todo_primary) {
+    $msg .= " and $primary is primary" if ($primary ne $host);
+  }
+  elsif ($primary ne $todo_primary) {
+    $todo_primary = "I" if ($todo_primary eq $host);
+    $msg .= " and $todo_primary should be primary";
+  }
+  lprint $msg . "\n";
+}
+
+sub mars_state_cmd {
+  my ($cmd, $res) = @_;
+  my $primary = _get_actual_primary($res) || '(none)';
+  my $todo_primary = _get_designated_primary($res);
+
+  if ($primary eq $host) {
+    lprint "is_primary\n";
+    return;
+  }
+  elsif ($todo_primary eq $host) {
+    lprint "becoming_primary\n";
+    return;
+  }
+
+  # secondary without ambitions to become primary
+
+  my $size = get_link("$mars/resource-$res/size");
+  my $syncstatus = get_link("$mars/resource-$res/syncstatus-$host");
+  if ($syncstatus != $size) {
+    lprint "secondary inconsistent ($syncstatus bytes of $size)\n";
+    return;
+  }
+
+  if ($primary eq "(none)") {
+    my $min = 0;
+    foreach my $path (glob("$mars/resource-$res/log-*")) {
+      my $nr = $path;
+      $nr =~ s:^.*[a-z]+-([0-9]+)(-[^/]*)?$:$1:;
+      if ($nr > $min) {
+	$primary = $path;
+	$primary =~ s:^.*/[a-z]+-[0-9]+-([^/]*)$:$1:;
+	$min = $nr;
+      }
+    }
+  }
+  my $primary_replay = get_link("$mars/resource-$res/replay-$primary");
+  my $host_replay = get_link("$mars/resource-$res/replay-$host");
+  if ($primary_replay eq $host_replay) {
+    lprint "secondary uptodate\n";
+    return;
+  }
+  lprint "secondary outdated ($host_replay instead of $primary_replay)\n";
+}
+
+sub cat_cmd {
+  my $cmd = shift;
+  foreach my $path (@_) {
+    _get_text($path, undef, 1);
   }
 }
 
-sub helplist {
-  my $temp;
-  $temp = shift;
-  lprint "ERROR: $temp" if ($temp);
-  lprint "
-marsadm <command> [<resource>] [<option>]
+sub mars_info_cmd {
+  my ($cmd, $res) = @_;
+  my $info = "$mars/resource-$res/logstatus-$host.status";
+  cat_cmd($cmd, $info);
+}
 
-<command> =
-  cluster    : create-cluster join-cluster leave-cluster
-  resource   : create-resource join-resource leave-resource
-               primary secondary invalidate
-               up down
-  replication: connect disconnect connect-local disconnect-local
-  replay     : pause-replay resume-replay pause-replay-local resume-replay-local
-  sync       : pause-sync resume-sync pause-sync-local resume-sync-local fake-sync
-  logfile    : log-rotate log-delete log-delete-all
-  device     : attach detach
-  internal   : help version
+sub show_cmd {
+  my ($cmd, $res) = @_;
+  $res = "*" if !$res || $res eq "all";
+  my $glob = "$mars/{ips/ip-$host,alive-$host,emergency-$host,rest-space-$host,resource-$res/{device,primary,size,actsize-$host,syncstatus-$host,replay-$host,actual-$host/*,todo-$host/*}}";
+  foreach my $link (glob($glob)) {
+    next unless -l $link;
+    my $res = get_link($link);
+    my $short = $link;
+    $short =~ s:^$mars/::;
+    lprint "$short=$res\n";
+  }
+}
 
-<resource> = name of resource or \"all\" for all resources
-
-<option>   = special by command
-
-Advanced information are also available here: http://http://wiki.intranet.1and1.com/bin/view/PO/ProjektTEC1603 
-  \n";
-  exit 0;
+sub show_errors_cmd {
+  my ($cmd, $res) = @_;
+  my $text = get_error_text(@_);
+  if ($text) {
+    lprint $text;
+    ldie "resource $res has some (old) problems.\n";
+  } else {
+    lprint "no errors/warnings are reported.\n";
+  }
 }
 
 sub version {
@@ -913,69 +2592,2544 @@ sub version {
 } 
 
 ##################################################################
+
+# pretty printing
+
+sub seconds2human {
+  my $seconds = shift;
+  return "--:--:--" unless (defined($seconds) && $seconds ne "" && $seconds >= 0);
+  return sprintf("%02d:%02d:%02d", $seconds / 3600, ($seconds % 3600) / 60, $seconds % 60);
+}
+
+sub number2human {
+  my ($unit, $number) = @_;
+  my $k = 1024;
+  my $use_float = ($number =~ m/\./);
+  $k = 1024.0 if $use_float;
+  $_ = $unit;
+ SWITCH: {
+    if (/t/i) {
+      $number /= $k * $k * $k * $k;
+      $unit = "TiB";
+      last SWITCH;
+    }
+    if (/g/i) {
+      $number /= $k * $k * $k;
+      $unit = "GiB";
+      last SWITCH;
+    }
+    if (/m/i) {
+      $number /= $k * $k;
+      $unit = "MiB";
+      last SWITCH;
+    }
+    if (/k/i) {
+      $number /= $k;
+      $unit = "KiB";
+      last SWITCH;
+    }
+    $unit = "B";
+  }
+  if ($use_float || ($number =~ m/\./)) {
+    $number = sprintf("%.3f", $number);
+  }
+  return ($unit, $number);
+}
+
+sub progress_bar {
+  my ($length, $min, $mid, $max) = @_;
+  $min = 0 if $min < 0;
+  $mid = $min if $mid < $min;
+  $max = $mid if $max < $mid;
+  $max = 1 if $max < 1;
+  my $pos1 =  $length * $min / $max;
+  my $bar = '=' x ($pos1 - 1);
+  if ($pos1 < $length) {
+    $bar .= ">";
+    $pos1++;
+  }
+  my $pos2 =  $length * $mid / $max;
+  if ($pos1 < $pos2) {
+    $bar .= ':' x ($pos2 - $pos1);
+  }
+  if ($pos2 < $length) {
+    $bar .= '.' x ($length - $pos2);
+  }
+  return "[$bar]";
+}
+
+##################################################################
+
+# macro evaluation
+
+sub make_numeric {
+  my $number = shift;
+  return 0 if (!defined($number) || $number eq "");
+  return $number;
+}
+
+sub set_args {
+  my $outer_env = shift;
+  my $inner_env = shift;
+  $$inner_env{"callstack"} .= "," if $$inner_env{"callstack"};
+  $$inner_env{"callstack"} .= ${_[0]};
+  my $index = 0;
+  while (defined(my $next = shift)) {
+    my $arg = parse_macro($next, $outer_env);
+    $$inner_env{$index++} = $arg;
+  }
+  # clear all other number variables to avoid confusion
+  while (defined($$inner_env{$index})) {
+    undef $$inner_env{$index++};
+  }
+}
+
+# evaluate a primitive macro
+sub eval_fn {
+  my $env = shift;
+  my $fn = shift;
+  # optionally allow primitive macros without prefix primitive- to be substituted
+  if ($fn !~ s/^primitive[-_]?//) {
+    my $macro = get_macro($fn, 1);
+    if ($macro) {
+      set_args($env, $env, $fn, @_);
+      return parse_macro($macro, $env);
+    }
+  }
+  my $arg1 = shift;
+  $_ = $fn;
+ SWITCH: {
+    if (/^$/) { # variable
+      my $varname;
+      # prefix *crement operators
+      if ($arg1 =~ m/^([-+]{2})$/) {
+	my $op = $arg1;
+	$varname = parse_macro(shift, $env);
+	if ($op =~ m/^\+/) {
+	  $$env{$varname}++;
+	} else {
+	  $$env{$varname}--;
+	}
+      } else {
+	$varname = parse_macro($arg1, $env);
+      }
+      my $result = "";
+      if (defined($$env{$varname})) {
+	$result = $$env{$varname};
+      }
+      # postfix *crement operators
+      if (defined(${_[0]}) && ${_[0]} =~ m/^([-+]{2})$/) {
+	my $op = shift;
+	if ($op =~ m/^\+/) {
+	  $$env{$varname}++;
+	} else {
+	  $$env{$varname}--;
+	}
+      }
+      # provisionary light-weight arrays based on CSV format
+      if (defined(my $delim = shift) && defined(my $index = shift)) {
+	$delim = parse_macro($delim, $env);
+	$index = parse_macro($index, $env);
+	my @list = split($delim, $result);
+	# get last element when denoted
+	$index = scalar(@list) - 1 if ($index eq "" || $index eq "*");
+	$result = $list[$index];
+      }
+      return $result;
+    }
+    if (/^let$/) { # assignment
+      my $varname = parse_macro($arg1, $env);
+      my $arg2 = shift;
+      my $value = parse_macro($arg2, $env);
+      $$env{$varname} = $value;
+      return "";
+    }
+    if (/^append$/) { # .=
+      my $varname = parse_macro($arg1, $env);
+      my $arg2 = shift;
+      my $value = parse_macro($arg2, $env);
+      $$env{$varname} .= $value;
+      return "";
+    }
+    if (/^set$/) { # provisionary light-weight arrays based on CSV format
+      my $varname = parse_macro($arg1, $env);
+      my $delim = shift;
+      $delim = parse_macro($delim, $env);
+      my $index = shift;
+      $index = parse_macro($index, $env);
+      my @list = split($delim, $$env{$varname});
+      # append to list when denoted
+      $index = scalar(@list) if ($index eq "" || $index eq "*");
+      my $value = shift;
+      $value = parse_macro($value, $env);
+      $list[$index] = $value;
+      $$env{$varname} = join($delim, @list);
+      return "";
+    }
+    if (/^dump[-_]?vars$/) { # write to stderr
+      foreach my $key (sort(keys(%$env))) {
+	next if $key =~ m/^__.*__$/;
+	my $val = $$env{$key};
+	lprint_stderr "$key='$val'\n";
+      }
+      return "";
+    }
+    if (/^([-+*\/%&|^]|>>|<<|min|max)$/) { # arithmetic / associative operators
+      my $op = $1;
+      my $number = make_numeric(parse_macro($arg1, $env));
+      while (defined(my $next = shift)) {
+	my $operand = make_numeric(parse_macro($next, $env));
+	$_ = $op;
+	if (/^\+$/) { $number += $operand; next; }
+	if (/^-$/)  { $number -= $operand; next; }
+	if (/^\*$/) { $number *= $operand; next; }
+	if (/^\/$/) { $number /= $operand; next; }
+	if (/^%$/)  { $number %= $operand; next; }
+	if (/^&$/)  { $number &= $operand; next; }
+	if (/^\|$/) { $number |= $operand; next; }
+	if (/^\^$/) { $number ^= $operand; next; }
+	if (/^<<$/) { $number <<= $operand; next; }
+	if (/^>>$/) { $number >>= $operand; next; }
+	if (/^min$/) { $number = $operand if $number < $operand; next; }
+	if (/^max$/) { $number = $operand if $number > $operand; next; }
+	ldie "bad arithmetic operator '$op'";
+      }
+      return $number;
+    }
+    if (/^([<>]=?|[!=]=)$/) { # numeric comparisons
+      my $op = $1;
+      my $n1 = make_numeric(parse_macro($arg1, $env));
+      my $arg2 = shift;
+      my $n2 = make_numeric(parse_macro($arg2, $env));
+      $_ = $op;
+      if (/^<$/) { return $n1 < $n2; }
+      if (/^>$/) { return $n1 > $n2; }
+      if (/^<=$/) { return $n1 <= $n2; }
+      if (/^>=$/) { return $n1 >= $n2; }
+      if (/^==$/) { return $n1 == $n2; }
+      if (/^!=$/) { return $n1 != $n2; }
+      ldie "bad comparison operator '$op'";
+    }
+    if (/^(lt|gt|le|ge|eq|ne|match|=~)$/) { # binary string operators
+      my $op = $1;
+      $op = "=~" if $op eq "match";
+      my $n1 = parse_macro($arg1, $env);
+      my $arg2 = shift;
+      my $n2 = parse_macro($arg2, $env);
+      $_ = $op;
+      if (/^lt$/) { return $n1 lt $n2; }
+      if (/^gt$/) { return $n1 gt $n2; }
+      if (/^le$/) { return $n1 le $n2; }
+      if (/^ge$/) { return $n1 ge $n2; }
+      if (/^eq$/) { return $n1 eq $n2; }
+      if (/^ne$/) { return $n1 ne $n2; }
+      if (/^=~$/)  {
+	my $opts = "m";
+	my $arg3 = shift;
+	$opts = parse_macro($arg3, $env) if defined($arg3);
+	# unfortunately standard regex operators don't seem to accept variable options, so we use eval()
+	my $result = eval("\$n1 =~ m{$n2}$opts");
+	return "" unless defined($result);
+	return $result;
+      }
+      ldie "bad binary operator '$op'";
+    }
+    if (/^(&&|\|\||and|or)$/) { # shortcut operators
+      my $op = $1;
+      $op = "&&" if $op eq "and";
+      $op = "||" if $op eq "or";
+      my $number = parse_macro($arg1, $env);
+      while (defined(my $next = shift)) {
+	$_ = $op;
+	if (/^&&$/)   { return 0 if !$number; }
+	if (/^\|\|$/) { return 1 if $number;  }
+	my $operand = parse_macro($next, $env);
+	$_ = $op;
+	if (/^&&$/)   { $number &= $operand; next; }
+	if (/^\|\|$/) { $number |= $operand; next; }
+	ldie "bad shortcut operator '$op'";
+      }
+      return $number;
+    }
+    if (/^([~!]|not)$/) { # unary operators
+      my $op = $1;
+      $op = "!" if $op eq "not";
+      my $number = parse_macro($arg1, $env);
+      $_ = $op;
+      if (/^~$/) { return ~$number; }
+      if (/^!$/) { return !$number; }
+      ldie "bad unary operator '$op'";
+    }
+    # string functions
+    if (/^toupper$/) {
+      my $txt = parse_macro($arg1, $env);
+      return uc($txt);
+    }
+    if (/^tolower$/) {
+      my $txt = parse_macro($arg1, $env);
+      return lc($txt);
+    }
+    if (/^length$/) { # string length
+      my $txt = parse_macro($arg1, $env);
+      return length($txt);
+    }
+    if (/^subst$/) { # regex substitution operator
+      my $txt = parse_macro($arg1, $env);
+      my $arg2 = shift;
+      my $regex = parse_macro($arg2, $env);
+      my $arg3 = shift;
+      my $subst = parse_macro($arg3, $env);
+      my $opts = "m";
+      my $arg4 = shift;
+      $opts = parse_macro($arg4, $env) if defined($arg4);
+      # unfortunately standard regex operators don't seem to accept variable options, so we use eval()
+      eval("\$txt =~ s{$regex}{$subst}$opts");
+      return $txt;
+    }
+    if (/s?printf$/) { # sprintf()
+      my $fmt = $arg1; # exception: don't evaluate the format string!
+      my @list = ();
+      while (defined(my $next = shift)) {
+	my $operand = parse_macro($next, $env);
+	push @list, $operand;
+      }
+      return sprintf($fmt, @list);
+    }
+    if (/^human[-_]?numbers?$/) { # convert numbers to readable format
+      my $name = $_;
+      my $unit = parse_macro($arg1, $env);
+      my $arg2 = shift;
+      my $delim_numbers = parse_macro($arg2, $env);
+      $delim_numbers = "/" if $delim_numbers eq "";
+      my $arg3 = shift;
+      my $delim_unit = parse_macro($arg3, $env);
+      $delim_unit = " " if $delim_unit eq "";
+      my $max = 0;
+      my @list = ();
+      while (defined(my $next = shift)) {
+	my $number = make_numeric(parse_macro($next, $env));
+	push @list, $number;
+	$max = $number if $number > $max;
+      }
+      lwarn "macro $name: no number arguments given\n" unless @list;
+      if (!$unit) {
+	if ($max >= 999 * 1024*1024*1024*1024) {
+	  $unit = "T";
+	} elsif ($max >= 999 * 1024*1024*1024) {
+	  $unit = "G";
+	} elsif ($max >= 99 * 1024*1024) {
+	  $unit = "M";
+	} elsif ($max >= 9 * 1024) {
+	  $unit = "K";
+	} else {
+	  $unit = "";
+	}
+      }
+      my @results = ();
+      my $conv_unit = "";
+      foreach my $number (@list) {
+	($conv_unit, my $conv_number) = number2human($unit, $number);
+	push @results, $conv_number;
+      }
+      return join($delim_numbers, @results) . "$delim_unit$conv_unit";
+    }
+    if (/^human[-_]?seconds$/) { # convert numbers to readable format
+      # don't use make_numeric() here in order to allow the result '--:--:--'
+      my $number = parse_macro($arg1, $env);
+      return seconds2human($number);
+    }
+    if (/^progress$/) { # progress bar
+      my $length = make_numeric(parse_macro($arg1, $env));
+      $length = 20 unless ($length && $length > 0);
+      my $arg2 = shift;
+      if (!defined($arg2)) { # use default values
+	my @vector = split(':', eval_fn($env, "summary-vector", ":"));
+	return progress_bar($length, @vector);
+      }
+      my $min = make_numeric(parse_macro($arg2, $env));
+      my $arg3 = shift;
+      my $mid = make_numeric(parse_macro($arg3, $env));
+      my $arg4 = shift;
+      my $max = make_numeric(parse_macro($arg4, $env));
+      return progress_bar($length, $min, $mid, $max);
+    }
+    if (/^errno[-_]?text$/) {
+      my $code = parse_macro($arg1, $env);
+      return "" unless defined($code) && $code != 0;
+      $code = -$code if $code < 0;
+      return __conv_errno("", $code);
+    }
+    if (/^get[-_]?log[-_]?status/) {
+      return get_error_text($$env{"cmd"}, $$env{"res"});
+    }
+    if (/^get[-_]?resource[-_]?(fat|err|wrn)([-_]?count)?/) {
+      my $what = $1;
+      my $do_count = $2;
+      my %assoc = ("fat" => 4, "err" => 3, "wrn" => 2);
+      my $glob = $$env{"resdir"} . "/$assoc{$what}.*.status";
+      return _get_text($glob, undef, 0, $do_count);
+    }
+    if (/^warn/) {
+      my $txt = parse_macro($arg1, $env);
+      lwarn $txt;
+      return "";
+    }
+    if (/^die$/) {
+      my $txt = parse_macro($arg1, $env);
+      ldie $txt;
+      return "";
+    }
+    if (/^is-module-loaded$/) {
+      my $path = "/proc/sys/mars";
+      my $result = -d $path;
+      return defined($result) && $result;
+    }
+    # list objects
+    if (/^cluster[-_]?members$/) {
+      my @peers = glob("$mars/ips/ip-*");
+      my $list = "";
+      foreach my $peer (sort(@peers)) {
+	$peer =~ s:^$mars/ips/ip-::;
+	$list .= "$peer\n";
+      }
+      return $list;
+    }
+    if (/^resource[-_]?members$/) {
+      my @peers = glob($$env{"resdir"} . "/data-*");
+      my $list = "";
+      foreach my $peer (sort(@peers)) {
+	$peer =~ s:^.*/data-::;
+	$list .= "$peer\n";
+      }
+      return $list;
+    }
+    if (/^(my|all)[-_]?resources$/) {
+      my $what = $1;
+      my $peer = "*";
+      if ($what eq "my") {
+	$peer = parse_macro($arg1, $env);
+	$peer = $$env{"host"} unless $peer;
+      }
+      my @list = glob("$mars/resource-*/data-$peer");
+      map { s:^$mars/resource-(.*?)/data-.*:$1:; } @list;
+      my $list = "";
+      my $old = "";
+      foreach my $item (sort(@list)) {
+	$list .= "$item\n" if $item ne $old;
+	$old = $item;
+      }
+      return $list;
+    }
+    # low-level symlink access
+    if (/^readlink$/) {
+      my $path = parse_macro($arg1, $env);
+      return get_link($path, 1);
+    }
+    if (/^setlink$/) {
+      my $src = parse_macro($arg1, $env);
+      my $arg2 = shift;
+      my $dst = parse_macro($arg2, $env);
+      set_link($src, $dst);
+      return "";
+    }
+    # high-level state access
+    if (/^(get|todo|actual)[-_]?primary$/) {
+      my $op = $1;
+      my $primary;
+      if ($op eq "actual") {
+	lwarn "DEPRECATED: you are trying to uniquely identify an actual primary hostname, but this is conceptually wrong because in split-brain situations there may exist multiple ones. Use view-is-primary instead. That would be safe.\n" unless $$env{cmd} =~ m/-1and1$/;
+	$primary = _get_actual_primary($$env{"res"});
+      } else {
+	$primary = _get_designated_primary($$env{"res"});
+      }
+      $primary = "" if (!defined($primary) || $primary eq "(none)");
+      $primary = ($primary eq $$env{"host"}) if $op eq "todo";
+      return $primary;
+    }
+    if (/^todo[-_]?(attach|sync|fetch|replay)?$/) {
+      my $what = $1;
+      $what = parse_macro($arg1, $env) unless defined($what);
+      my $lnk = $$env{"resdir"} . "/todo-" . $$env{"host"} . "/$what";
+      $lnk = correct_path($lnk);
+      return get_link($lnk, 1);
+    }
+    if (/^get[-_]?msg$/) {
+      my $what = parse_macro($arg1, $env);
+      my $lnk = $$env{"resdir"} . "/actual-" . $$env{"host"} . "/msg-$what";
+      return get_link($lnk, 1);
+    }
+    if (/^(all|the)[-_](pretty[-_]?)?(global[-_]?)?((?:err|wrn|inf)[-_])?(msg|count)$/) {
+      my $shorten = ($1 eq "the");
+      my $pretty = $2;
+      my $global = $3;
+      my $specific = $4;
+      my $type = $5;
+      $specific = "" unless defined($specific);
+      my $glob = "$mars";
+      $glob = $$env{"resdir"} if (!defined($global) && $$env{"res"});
+      $glob .= "/actual-" . $$env{"host"} . "/msg-$specific*";
+      my $result = "";
+      my $count = 0;
+      foreach my $msg_path (glob($glob)) {
+	my $val = get_link($msg_path, 1);
+	if ($shorten) {
+	  # skip uninteresting messages
+	  next if $val =~ m/^OK/;
+	  # skip _transient_ error messages
+	  if ($msg_path =~ m/-err-/ && $val =~ m/^([0-9]+\.[0-9]{9})/) {
+	    my $stamp = $1;
+	    if ($stamp) {
+	      my $delta = $timeout > 0 ? $timeout : 30;
+	      next if $stamp + $delta > time();
+	    }
+	  }
+	}
+	$val = _replace_timestamps($val, $shorten) if defined($pretty);
+	my $key = $msg_path;
+	$key =~ s:^.*/msg-::;
+	$result .= "$key: $val\n";
+	$count++;
+      }
+      return $count if $type eq "count";
+      return $result;
+    }
+    if (/^is[-_]?alive$/) {
+      my $peer = parse_macro($arg1, $env);
+      $peer = _get_designated_primary($$env{"res"}) unless $peer;
+      $peer = $$env{"host"} unless $peer;
+      my $lnk = "$mars/alive-$peer";
+      return is_link_recent($lnk, $$env{"window"});
+    }
+    if (/^alive[-_]?timestamp$/) {
+      my $peer = parse_macro($arg1, $env);
+      $peer = _get_designated_primary($$env{"res"}) unless $peer;
+      return -1 if !$peer || $peer eq "(none)";
+      my $lnk = "$mars/alive-$peer";
+      return get_link_stamp($lnk);
+    }
+    if (/^is[-_]?(almost[-_]?)?consistent$/) {
+      my $almost = $1;
+      # has sync finished?
+      my $syncrest = make_numeric(eval_fn($env, "sync-rest", ""));
+      return 0 if $syncrest > 0;
+      if (!$almost && eval_fn($env, "is-primary", "")) {
+	# is the replay link indicating that something is not yet applied / dirty?
+	my $replay = get_link($$env{"resdir"} . "/replay-" . $$env{"host"}, 1);
+	$replay =~ m:,[0-9]+,([0-9]+):;
+	my $rest = $1;
+	return 0 if $rest > 0;
+      }
+      # are all logfiles applied which had accumulated during sync?
+      my $replay  = get_link($$env{"resdir"} . "/replay-" . $$env{"host"}, 1);
+      return 0 unless $replay;
+      my $syncpos = get_link($$env{"resdir"} . "/syncpos-" . $$env{"host"}, 2);
+      if (defined($syncpos) && $syncpos) {
+	my $cmp = compare_replaylinks($syncpos, $replay);
+	return 0 if $cmp > 0;
+      }
+      return 1;
+    }
+    if (/^get[-_]?(disk|device)$/) {
+      my $what = $1;
+      $what = "data" if $what eq "disk";
+      my $lnk = $$env{"resdir"} . "/$what-" . $$env{"host"};
+      my $result = get_link($lnk, 1);
+      $result = "" unless defined($result);
+      $result = "/dev/mars/$result" if ($what eq "device" && $result !~ m:^/:);
+      return $result;
+    }
+    if (/^(disk|device)[-_]?present$/) {
+      my $what = $1;
+      $what = "data" if $what eq "disk";
+      my $lnk = $$env{"resdir"} . "/$what-" . $$env{"host"};
+      my $result = get_link($lnk, 1);
+      $result = "" unless defined($result);
+      $result = "/dev/mars/$result" if ($what eq "device" && $result !~ m:^/:);
+      if ($result) {
+	$result = -b $result;
+	$result = "0" unless defined($result);
+      }
+      return $result;
+    }
+    # deprecated (irregular names)
+    if (/^present[-_]?(disk|device)$/) {
+      my $what = $1;
+      return eval_fn($env, "$what-present", $arg1);
+    }
+    if (/^(device)[-_]?opened$/) {
+      my $what = $1;
+      my $peer = $$env{"host"};
+      if ($what eq "device") {
+	my $other = eval_fn($env, "get-device", $arg1);
+	if ($other =~ m/\@(.*)/) {
+	  $peer = $1;
+	}
+      }
+      my $lnk = $$env{"resdir"} . "/actual-$peer/open-count";
+      my $result = get_link($lnk, 1);
+      $result = "0" unless defined($result);
+      return $result;
+    }
+    if (/^is[-_]?split([-_]?brain)?$/) {
+      my $split = detect_splitbrain($$env{"res"}, 0);
+      return $split ? 0 : 1;
+    }
+    if (/^is[-_]?(attach|sync|fetch|replay|primary|emergency)$/) {
+      my $what = $1;
+      my $is = "is";
+      $is = "has" if $what eq "emergency";
+      my $lnk = $$env{"resdir"} . "/actual-" . $$env{"host"} . "/$is-$what";
+      $lnk = correct_path($lnk);
+      return get_link($lnk, 1);
+    }
+    if (/^does$/) {
+      my $what = parse_macro($arg1, $env);
+      my $is = "is";
+      $is = "has" if $what eq "emergency";
+      my $lnk = $$env{"resdir"} . "/actual-" . $$env{"host"} . "/$is-$what";
+      $lnk = correct_path($lnk);
+      return get_link($lnk, 1);
+    }
+    if (/^(tree|rest-space)$/) {
+      my $what = $1;
+      my $lnk = "$mars/$what-$host";
+      $lnk = correct_path($lnk);
+      return get_link($lnk, 1);
+    }
+    if (/^(uuid)$/) {
+      my $what = $1;
+      my $lnk = "$mars/$what";
+      $lnk = correct_path($lnk);
+      return get_link($lnk, 1);
+    }
+    if (/^replay[-_]?code$/) {
+      my $lnk = $$env{"resdir"} . "/actual-" . $$env{"host"} . "/replay-code";
+      return get_link($lnk, 2);
+    }
+    if (/^(sync|fetch|replay|work)[-_]?(rate|remain)$/) {
+      my $what = $1;
+      my $select = $2;
+      if ($what eq "work") {
+	my $val1 = eval_fn($env, "fetch-$select", "");
+	my $val2 = eval_fn($env, "replay-$select", "");
+	return "" if (!defined($val1) || $val1 eq "");
+	return "" if (!defined($val2) || $val2 eq "");
+	$val1 = make_numeric($val1);
+	$val2 = make_numeric($val2);
+	return $val1 + $val2 if $select eq "remain";
+	# take the maximum rate
+	return $val1 if $val1 > $val2;
+	return $val2;
+      }
+      my %names =
+	(
+	 "sync"   => "sync_rate",
+	 "fetch"  => "file_rate",
+	 "replay" => "replay_rate",
+	);
+      my $lnk = $$env{"resdir"} . "/actual-" . $$env{"host"} . "/" . $names{$what};
+      my $rate = get_link($lnk, 2);
+      return "" if !defined($rate) || $rate eq "" || $rate < 0;
+      return $rate * 1024 if $select eq "rate";
+      if ($select eq "remain") {
+	my $rest = make_numeric(eval_fn($env, "$what-rest", ""));
+	return 0 if $rest <= 0;
+	return -1 if ($rate <= 0);
+	return $rest / 1024 / $rate;
+      }
+      ldie "unknown macro $_\n";
+    }
+    if (/^sync[-_]?size$/) {
+      my $lnk = $$env{"resdir"} . "/size";
+      return get_link($lnk, 1);
+    }
+    if (/^sync[-_]?pos$/) {
+      my $lnk = $$env{"resdir"} . "/syncstatus-" . $$env{"host"};
+      return get_link($lnk, 1);
+    }
+    if (/^(replay|work)[-_]?(pos|lognr|basenr)$/) {
+      my $what = $1;
+      my $op   = $2;
+      my ($sum, $firstpos, $logpos, $level) = get_amount($$env{"resdir"}, $$env{"host"}, -1, 0);
+      return $firstpos if $op eq "lognr";
+      return $logpos if $op eq "basenr";
+      return $sum;
+    }
+    if (/^(replay[-_]?size)|(fetch[-_]?pos)$/) {
+      my ($sum0) = get_amount($$env{"resdir"}, $$env{"host"}, -1, 0);
+      my ($sum, $firstpos, $logpos, $level) = get_amount($$env{"resdir"}, $$env{"host"}, 1, 1);
+      return $sum0 + $sum;
+    }
+    if (/^(fetch|work)[-_]?(size|lognr)$/) {
+      my $what = $1;
+      my $op   = $2;
+      my ($sum0) = get_amount($$env{"resdir"}, $$env{"host"}, -1, 0);
+      my ($sum, $firstpos, $logpos, $level) = get_amount($$env{"resdir"}, $$env{"host"}, 1, 0);
+      return $logpos if $op eq "lognr";
+      return $sum0 + $sum;
+    }
+    if (/^(sync|fetch|replay|work)[-_]?(rest|(?:almost[-_]?|threshold[-_]?)?reached|percent|permille|vector)$/) {
+      my $what = $1;
+      my $op   = $2;
+      my $size = make_numeric(eval_fn($env, "$what-size", ""));
+      my $pos  = make_numeric(eval_fn($env, "$what-pos",  ""));
+      my $result = 0;
+      if ($op eq "rest") {
+	$result = $size - $pos if $pos < $size;
+      } elsif ($op =~ m/^almost/) {
+	my $limit = make_numeric(parse_macro($arg1, $env)) if $arg1 ne "";
+	$limit = 990 if $limit <= 0;
+	$result = 1 if int($pos / $limit) >= int($size / 1000);
+      } elsif ($op =~ m/^threshold/) {
+	my $my_threshold = make_numeric($$env{"threshold"});
+	$arg1 = parse_macro($arg1, $env);
+	$my_threshold = make_numeric(get_size($arg1)) if $arg1 ne "";
+	$result = 1 if $pos + $my_threshold >= $size;
+      } elsif ($op eq "reached") {
+	$result = 1 if $pos >= $size;
+      } elsif ($op eq "percent") {
+	$result = 100;
+	$result = 100.5 * $pos / $size if $size > 0;
+	$result = 100 if $result >= 100.0;
+      } elsif ($op eq "permille") {
+	$result = 1000;
+	$result = 1000.5 * $pos / $size if $size > 0;
+	$result = 1000 if $result >= 1000.0;
+      } elsif ($op eq "vector") {
+	my $delim = parse_macro($arg1, $env);
+	$delim = ":" unless $delim;
+	$result = "$pos$delim$size";
+      } else {
+	ldie "unknown operation '$op'\n";
+      }
+      return $result;
+    }
+    if (/^summary[-_]?vector$/) {
+      my $pos1 = make_numeric(eval_fn($env, "replay-pos", ""));
+      my $pos2 = make_numeric(eval_fn($env, "fetch-pos",  ""));
+      my $size = make_numeric(eval_fn($env, "fetch-size", ""));
+      my $delim = parse_macro($arg1, $env);
+      $delim = ":" unless $delim;
+      return "$pos1$delim$pos2$delim$size";
+    }
+    if (/^deletable[-_]?size$/) {
+      my ($min, $max) = _get_deletable_logfiles($_, $$env{"res"});
+      my $sum = 0;
+      foreach my $path (glob("$mars/resource-" . $$env{"res"} . "/log-*")) {
+	$path =~ m/\/log-([0-9]+)-/;
+	my $nr = $1;
+	next if $nr < $min or $nr >= $max;
+	my @stat = stat($path);
+	$sum += $stat[7];
+      }
+      return $sum;
+    }
+    if (/^occupied[-_]?size$/) {
+      my $sum = 0;
+      foreach my $path (glob("$mars/resource-" . $$env{"res"} . "/log-*")) {
+	$path =~ m/\/log-([0-9]+)-/;
+	my @stat = stat($path);
+	$sum += $stat[7];
+      }
+      return $sum;
+    }
+    if (/^(disk|resource|device)[-_]?size$/) {
+      my $what = $1;
+      my $path = "$mars/resource-" . $$env{"res"};
+      if ($what eq "device" && eval_fn($env, "device-present", "")) {
+	return _get_mars_size($$env{"cmd"}, $$env{"res"});
+      } elsif ($what eq "disk"){
+	my $peer = parse_macro($arg1, $env);
+	$peer = $$env{"host"} unless $peer;
+	$path .= "/actsize-$peer";
+      } else {
+	$path .= "/size";
+      }
+      return get_link($path, 1);
+    }
+    # time handling and pausing
+    if (/^time$/) {
+      return mars_time();
+    }
+    if (/^replay[-_]?timestamp$/) {
+      $arg1 = parse_macro($arg1, $env);
+      $arg1 = $$env{"host"} unless $arg1;
+      my $replay = $$env{"resdir"} . "/replay-$arg1";
+      return get_link_stamp($replay);
+    }
+    if (/^fetch[-_]?timestamp$/) {
+      $arg1 = parse_macro($arg1, $env);
+      $arg1 = $$env{"host"} unless $arg1;
+      my $fetch_glob = $$env{"resdir"} . "/version-*-$arg1";
+      my @paths = sort(glob($fetch_glob));
+      return -1 if !@paths;
+      my $fetch = pop(@paths);
+      return get_link_stamp($fetch);
+    }
+    if (/^work[-_]?timestamp$/) {
+      my $time1 = make_numeric(eval_fn($env, "fetch-timestamp", $arg1));
+      my $time2 = make_numeric(eval_fn($env, "replay-timestamp", $arg1));
+      # use the "best" of both...
+      return $time1 if $time1 > $time2;
+      return $time2;
+    }
+    if (/^(fetch|replay|work|alive)[-_]?age$/) {
+      my $what = $1;
+      my $time = make_numeric(eval_fn($env, "$what-timestamp", $arg1));
+      return -1 if $time <= 0;
+      return int(mars_time()) - $time;
+    }
+    if (/^(fetch|replay|work|alive)[-_]?lag$/) {
+      my $what = $1;
+      $arg1 = $$env{"host"} unless $arg1;
+      my $arg2 = shift;
+      my $primary = parse_macro($arg2, $env);
+      if (!$primary) {
+	$primary = _get_designated_primary($$env{"res"});
+      }
+      return -1 if !$primary || $primary eq "(none)";
+      my $time1 = make_numeric(eval_fn($env, "$what-timestamp", $arg1));
+      my $time2 = make_numeric(eval_fn($env, "$what-timestamp", $primary));
+      return -1 if ($time1 <= 0 || $time2 <= 0);
+      return 0 if $time1 < $time2;
+      return $time1 - $time2;
+    }
+    if (/^sleep$/) {
+      my $time = parse_macro($arg1, $env);
+      sleep($time);
+      return "";
+    }
+    if (/^timeout$/) {
+      my $time = parse_macro($arg1, $env);
+      sleep_timeout($time);
+      return "";
+    }
+    if (/^wait[-_]?((?:todo|is)[-_](?:attach|sync|fetch|replay|primary)[-_](?:on|off))$/) {
+      my $specific = $1;
+      $specific =~ s/_/-/g;
+      wait_cond($$env{"cmd"}, $$env{"res"}, $specific);
+      return "";
+    }
+    if (/^wait(?:[-_]?resource)?$/) {
+      my $specific = parse_macro($arg1, $env);
+      wait_cond($$env{"cmd"}, $$env{"res"}, $specific);
+      return "";
+    }
+    if (/^wait[-_]?cluster$/) {
+      my $specific = parse_macro($arg1, $env);
+      wait_cluster($$env{"cmd"}, $$env{"res"}, $specific);
+      return "";
+    }
+    # generic flow control and loops
+    if (/^(get|foreach)[-_]?glob$/) {
+      my $op = $1;
+      my $paths = parse_macro($arg1, $env);
+      my $arg2 = shift;
+      my $varname = parse_macro($arg2, $env);
+      my $arg3 = shift;
+      my @list = glob($paths);
+      my $result = "";
+      if ($op eq "get") {
+	my $delim = parse_macro($arg3, $env);
+	foreach my $path (@list) {
+	  $result .= $delim if $result;
+	  $result .= $path;
+	}
+      } else { # foreach
+	foreach my $path (@list) {
+	  $$env{$varname} = $path;
+	  $result .= parse_macro($arg3, $env);
+	}
+      }
+      return $result;
+    }
+    if (/^(if|unless)$/) {
+      my $op = $1;
+      my $cond = parse_macro($arg1, $env);
+      $cond = !$cond if $op eq "unless";
+      my $arg2 = shift;
+      if ($cond) {
+	ldie "undefined $op-part\n" unless defined($arg2);
+	return parse_macro($arg2, $env);
+      } elsif (defined(my $arg3 = shift)) {
+	return parse_macro($arg3, $env);
+      }
+      return "";
+    }
+    if (/^else?(if|unless)$/) {
+      my $op = $1;
+      unshift @_, $arg1;
+      while (defined(my $arg1 = shift)) {
+	if (defined(my $arg2 = shift)) {
+	  my $cond = parse_macro($arg1, $env);
+	  $cond = !$cond if $op eq "unless";
+	  if ($cond) {
+	    return parse_macro($arg2, $env);
+	  }
+	} else { # odd number of arguments is treated as final "else"
+	  return parse_macro($arg1, $env);
+	}
+      }
+      return "";
+    }
+    if (/^while$/) {
+      my $arg2 = shift;
+      my $result = "";
+      while (parse_macro($arg1, $env)) {
+	$result .= parse_macro($arg2, $env);
+	next if _control_macro($env, "__next__");
+	last if _control_macro($env, "__last__");
+      }
+      return $result;
+    }
+    if (/^until$/) {
+      my $arg2 = shift;
+      my $result = "";
+      until (parse_macro($arg1, $env)) {
+	$result .= parse_macro($arg2, $env);
+	next if _control_macro($env, "__next__");
+	last if _control_macro($env, "__last__");
+      }
+      return $result;
+    }
+    if (/^for$/) {
+      my ($arg2, $arg3, $arg4) = (shift, shift, shift);
+      my $result = "";
+      for (parse_macro($arg1, $env); parse_macro($arg2, $env); parse_macro($arg3, $env)) {
+	$result .= parse_macro($arg4, $env);
+	next if _control_macro($env, "__next__");
+	last if _control_macro($env, "__last__");
+      }
+      return $result;
+    }
+    if (/^foreach$/) {
+      my $varname = parse_macro($arg1, $env);
+      my $arg2 = shift;
+      my $txt     = parse_macro($arg2, $env);
+      my $arg3 = shift;
+      my $delim   = parse_macro($arg3, $env);
+      my $arg4 = shift;
+      my $result = "";
+      foreach my $value (split($delim, $txt)) {
+	$$env{$varname} = $value;
+	$result .= parse_macro($arg4, $env);
+	next if _control_macro($env, "__next__");
+	last if _control_macro($env, "__last__");
+      }
+      return $result;
+    }
+    if (/^protect$/) { # don't evaluate argument, take verbatim
+      return $arg1;
+    }
+    if (/^eval$/) { # evaluate given number of times
+      my $count = parse_macro($arg1, $env);
+      my $arg2 = shift;
+      while ($count-- > 0) {
+	$arg2 = parse_macro($arg2, $env);
+      }
+      return $arg2;
+    }
+    if (/^eval[-_]?down$/) { # evaluate until result is stable
+      for (;;) {
+	my $old = $arg1;
+	$arg1 = parse_macro($arg1, $env);
+	last if $arg1 eq $old;
+      }
+      return $arg1;
+    }
+    if (/^tmp$/) { # evaluate once in a temporary scope
+      my %copy_env = %$env;
+      my $result = parse_macro($arg1, \%copy_env);
+      return $result;
+    }
+    if (/^(include|call)$/) {
+      my $op = $1;
+      my $name = parse_macro($arg1, $env);
+      my $txt = get_macro($name);
+      if ($op eq "call") { # run in new sub-scope
+	my %copy_env = %$env;
+	set_args($env, \%copy_env, $name, @_);
+	return parse_macro($txt, \%copy_env);
+      }
+      # 'include' runs in the same scope
+      set_args($env, $env, $name, @_);
+      return parse_macro($txt, $env);
+    }
+    if (/^callstack$/) {
+      return $$env{"callstack"};
+    }
+    if (/^(abort|return|stop-eval)$/) {
+      my $op = $1;
+      $$env{$op} = 1;
+      return "";
+    }
+    if (/^(next|last)$/) {
+      my $op = $1;
+      $$env{$op} = 1;
+      $$env{"__return__"} = 1;
+      return "";
+    }
+    ldie "call to unknown macro '$fn'\n";
+  }
+}
+
+##################################################################
+
+# macro parsing
+
+my $match_comment = "#[^\n]*\n|//[^\n]*\n|/\\*(?:[^*]|\\*[^/])*\\*/|\\\\\n\\s*";
+my $match_nobrace = qr'(?:[^{}\\]|\\.)*'s;
+my $match_inner = $match_nobrace;
+my $match_brace = qr"\{$match_inner\}"s;
+for (my $i = 0; $i < 20; $i++) {
+  $match_inner = qr"$match_nobrace(?:$match_brace$match_nobrace)*"s;
+  $match_brace = qr"\{$match_inner\}"s;
+}
+my $match_fn_head = qr"\%([^\\\s{}()\[\]]*)(?=\{)"s;
+my $match_fn = qr"$match_fn_head(?:\{($match_inner)\})"s;
+
+sub _control_macro {
+  my $env = shift;
+  my $control = shift;
+  my $result = $$env{$control};
+  $$env{$control} = 0;
+  return $result;
+}
+
+sub parse_macro {
+  my ($text, $env) = @_;
+  $text = "" unless defined($text);
+  my $old_callstack = $$env{"callstack"};
+  my $result = "";
+  while ($text =~ m/\\(.)|$match_fn/sp) {
+    my $escape = $1;
+    my $fn = $2;
+    my @args = ($3);
+    my $pre = $PREMATCH;
+    my $post = $POSTMATCH;
+    if (defined($escape)) {
+      $result .= $pre;
+      $text = $post;
+      $_ = $escape;
+      if (/[tnrfbae]/) {
+	eval "\$result .= \"\\$escape\"";
+	next;
+      }
+      if (/[a-zA-Z]/) {
+	lwarn "control sequence '\\$escape' is reserved for future use\n";
+      }
+      $result .= $escape;
+      next;
+    }
+    return "" if _control_macro($env, "__abort__");
+    return $result if _control_macro($env, "__return__");
+    return $result . $text if _control_macro($env, "__stop_eval__");
+    $result .= $pre;
+    $text = $post;
+    while ($text =~ m/\A\{($match_inner)\}/sp ) {
+      push @args, $1;
+      $text = $POSTMATCH;
+    }
+    my $new = eval_fn($env, $fn, (@args));
+    ldie "undefined result from evaluation of primitive macro '$fn'\n" unless defined($new);
+    $$env{"callstack"} = $old_callstack;
+    $result .= $new;
+  }
+  return "" if _control_macro($env, "__abort__");
+  return $result if _control_macro($env, "__return__");
+  return $result . $text if _control_macro($env, "__stop_eval__");
+  return $result . $text;
+}
+
+sub eval_macro {
+  my ($cmd, $res, $text) = (shift, shift, shift);
+  $text =~ s{$match_comment}{}sg;
+  my %start_env =
+    (
+     "cmd"       => $cmd,
+     "res"       => $res,
+     "resdir"    => "$mars/resource-$res",
+     "mars"      => $mars,
+     "host"      => $host,
+     "ip"        => $ip,
+     "timeout"   => $timeout,
+     "threshold" => $threshold,
+     "window"    => $window,
+     "force"     => $force,
+     "dry-run"   => $dry_run,
+     "verbose"   => $verbose,
+     "callstack" => "",
+     # internal, deliberately not documented
+     "__abort__"     => 0,
+     "__return__"    => 0,
+     "__stop_eval__" => 0,
+     "__next__"      => 0,
+     "__last__"      => 0,
+    );
+  set_args(\%start_env, \%start_env, $cmd, @_);
+  return parse_macro($text, \%start_env);
+}
+
+##################################################################
+
+# macro commands
+
+my $macro = "";
+
+my %complex_macros =
+  (
+   "default"
+   => "%if{%{res}}{"
+   .    "  %{res} %include{diskstate} %include{replstate} %include{flags} %include{role} %include{primarynode} %include{commstate}\n"
+   .    "%if{%>{%-{%disk-size{}}{%resource-size{}}}{%{threshold}}}{"
+   .    "     Hint: you are wasting %human-numbers{}{ }{ }{%-{%disk-size{}}{%resource-size{}}} on disk %get-disk{}\n"
+   .    "}"
+   .    "%if{%and{%not{%is-primary{}}}{%is-attach{}}}{"
+   .      "%if{%not{%sync-reached{}}}{"
+   .        "%include{syncinfo}"
+   .      "}"
+   .      "%if{%not{%work-reached{}}}{"
+   .        "%include{replinfo}"
+   .      "}"
+   .    "}"
+   .    "%call{resource-errors}"
+   .  "}",
+
+   "default-global"
+   => "%call{comminfo}",
+
+   "1and1"
+   => "%if{%{res}}{"
+   .    "  %{res} %include{diskstate-1and1} %include{replstate-1and1} %include{flags-1and1} %include{role-1and1} %include{primarynode-1and1}\n"
+   .    "%if{%and{%is-attach{}}{%not{%sync-reached{}}}}{"
+   .      "%include{syncinfo-1and1}"
+   .    "}"
+   .    "%if{%and{%is-attach{}}{%not{%work-threshold-reached{}}}}{"
+   .      "%include{replinfo-1and1}"
+   .    "}"
+   .    "%call{resource-errors-1and1}"
+   .  "}{"
+   .    "%the-pretty-global-msg{}"
+   .  "}",
+
+   "diskstate"
+   => "%elsif{%not{%get-disk{}}}{"
+   .    "NotJoined"
+   .  "}{%not{%disk-present{}}}{"
+   .    "NotPresent"
+   .  "}{%not{%todo-attach{}}}{"
+   .    "%if{%is-attach{}}{"
+   .      "Detaching"
+   .    "}{"
+   .      "Detached"
+   .    "}"
+   .  "}{%and{%replay-code{}}{%<{%replay-code{}}{0}}}{"
+   .    "DefectiveLog[%errno-text{%replay-code{}}]"
+   .  "}{%not{%is-attach{}}}{"
+   .    "NoAttach"
+   .  "}{%not{%is-consistent{}}}{"
+   .    "%elsif{%not{%todo-primary{}}}{"
+   .      "InConsistent"
+   .    "}{%is-primary{}}{"
+   .      "WriteBack"
+   .    "}{"
+   .      "Recovery"
+   .    "}"
+   .  "}{%not{%work-reached{}}}{"
+   .    "%elsif{%not{%todo-primary{}}}{"
+   .      "OutDated[%call{outdated-flags}]"
+   .    "}{%is-primary{}}{"
+   .      "WriteBack"
+   .    "}{"
+   .      "Recovery"
+   .    "}"
+   .  "}{%and{%ne{%get-primary{}}{}}{%tmp{%let{host}{%get-primary{}}%is-emergency{}}}}{"
+   .    "EmergencyMode"
+   .  "}{"
+   .    "UpToDate"
+   .  "}",
+
+   "diskstate-1and1"
+   => "%if{%disk-present{}}{"
+   .    "%if{%does{attach}}{"
+   .      "%if{%is-almost-consistent{}}{"
+   .        "%if{%work-reached{}}{"
+   .          "Uptodate"
+   .        "}{"
+   .          "Outdated[%call{outdated-flags-1and1}]"
+   .        "}"
+   .      "}{Inconsistent}"
+   .    "}{Detached}"
+   .  "}{Detached}",
+
+   "outdated-flags"
+   => "%if{%fetch-reached{}}{}{F}%if{%replay-reached{}}{}{R}",
+
+   "outdated-flags-1and1"
+   => "%if{%fetch-reached{}}{}{F}%if{%replay-reached{}}{}{R}",
+
+   "replstate"
+   => "%elsif{%not{%is-module-loaded{}}}{"
+   .    "ModuleNotLoaded"
+   .  "}{%not{%is-alive{%{host}}}}{"
+   .    "UnResponsive"
+   .  "}{%not{%get-disk{}}}{"
+   .    "NotJoined"
+   .  "}{%not{%todo-attach{}}}{"
+   .    "NotStarted"
+   .  "}{%todo-primary{}}{"              # I am designated primary
+   .      "%elsif{%is-emergency{}}{"
+   .        "EmergencyMode"
+   .      "}{%is-primary{}}{"
+   .        "Replicating"
+   .      "}{"
+   .        "NotYetPrimary"
+   .      "}"
+   .  "}{"                               # Secondary
+   .      "%elsif{%and{%sync-rest{}}{%not{%todo{sync}}}}{"
+   .        "PausedSync"
+   .      "}{%is-sync{}}{"
+   .        "Syncing"
+   .      "}{%not{%todo{fetch}}}{"
+   .        "PausedFetch"
+   .      "}{%not{%todo{replay}}}{"
+   .        "PausedReplay"
+   .      "}{%not{%get-primary{}}}{"
+   .        "NoPrimaryDesignated"
+   .      "}{%not{%is-alive{}}}{"
+   .        "PrimaryUnreachable"
+   .      "}{"
+   .        "Replaying"
+   .      "}"
+   .  "}",
+
+   "replstate-1and1"
+   => "%if{%disk-present{}}{"
+   .    "%if{%is-primary{}}{"
+   .      "Replicating"
+   .    "}{"
+   .      "%if{%is-alive{}}{"
+   .        "%if{%and{%not{%sync-reached{}}}{%not{%todo{sync}}}}{"
+   .          "PausedSync"
+   .        "}{"
+   .          "%if{%does{sync}}{"
+   .            "Syncing"
+   .          "}{"
+   .            "%unless{%and{%todo-fetch{}}{%todo-replay{}}}{"
+   .              "PausedReplay"
+   .            "}{Replaying}"
+   .          "}"
+   .        "}"
+   .      "}{PrimaryUnreachable}"
+   .    "}"
+   .  "}{NotJoined}",
+
+   "flags"
+   => "%if{%disk-present{}}{%if{%device-present{}}{D}{d}}{-}"
+   .  "%if{%is-consistent{}}{C}{%if{%disk-present{}}{c}{-}}"
+   .  "%if{%does{attach}}{%if{%todo{attach}}{A}{a}}{%if{%todo{attach}}{a}{-}}"
+   .  "%if{%sync-reached{}}{S}{%if{%todo{sync}}{s}{-}}"
+   .  "%if{%fetch-reached{}}{F}{%if{%todo{fetch}}{f}{-}}"
+   .  "%if{%replay-reached{}}{R}{%if{%todo{replay}}{r}{-}}",
+
+   "flags-1and1"
+   => "-%if{%todo{sync}}{S}{-}%if{%todo{fetch}}{F}{-}%if{%todo{replay}}{R}{-}-",
+
+   "todo-role"
+   => "%if{%disk-present{}}{"
+   .    "%if{%todo-primary{}}{"
+   .      "Primary"
+   .    "}{"
+   .      "Secondary"
+   .    "}"
+   .  "}{None}",
+
+   "role"
+   => "%if{%disk-present{}}{"
+   .    "%if{%todo-primary{}}{"
+   .      "%if{%is-primary{}}{"
+   .        "Primary"
+   .      "}{"
+   .        "NotYetPrimary"
+   .      "}"
+   .    "}{"
+   .      "%if{%is-primary{}}{"
+   .        "RemainsPrimary"
+   .      "}{"
+   .        "Secondary"
+   .      "}"
+   .    "}"
+   .  "}{None}",
+
+   "role-1and1"
+   => "%if{%disk-present{}}{"
+   .    "%if{%is-primary{}}{"
+   .      "Primary"
+   .    "}{"
+   .      "Secondary"
+   .    "}"
+   .  "}{Secondary}",
+
+   "primarynode"
+   => "%if{%todo-primary{}}{"
+   .    "%{host}"
+   .  "}{"
+   .    "%get-primary{}"
+   .  "}",
+
+   "primarynode-1and1"
+   => "%if{%disk-present{}}{"
+   .    "%if{%is-primary{}}{"
+   .      "%{host}"
+   .    "}{"
+   .      "%if{%actual-primary{}}{"
+   .        "%actual-primary{}"
+   .      "}{-}"
+   .    "}"
+   .  "}{-}",
+
+   "commstate"
+   => "%let{comm}{%alive-age{}}"
+   .  "%if{%>={%{comm}}{%{window}}}{"
+   .    "%human-seconds{%{comm}}"
+   .  "}",
+
+   "syncinfo"
+   => "%let{amount}{%human-numbers{}{ }{ }{%sync-pos{}}{%sync-size{}}}"
+   .  "%let{rate}{%human-numbers{}{ }{ }{%sync-rate{}}}"
+   .  "%sprintf{     syncing: %s  %.2f%%  (%d/%d)%s  rate: %.2f %s/sec  remaining: %s hrs\n}"
+   .          "{%progress{20}{%sync-pos{}}{0}{%sync-size{}}}"
+   .          "{%sync-percent{}}"
+   .          "{%{amount}{ }{0}}"
+   .          "{%{amount}{ }{1}}"
+   .          "{%{amount}{ }{2}}"
+   .          "{%{rate}{ }{0}}"
+   .          "{%{rate}{ }{1}}"
+   .          "{%human-seconds{%sync-remain{}}}"
+   .  "%call{sync-line}",
+
+   "syncinfo-1and1"
+   => "%let{amount}{%human-numbers{}{ }{ }{%sync-pos{}}{%sync-size{}}}"
+   .  "%let{rate}{%human-numbers{}{ }{ }{%sync-rate{}}}"
+   .  "%sprintf{     syncing: %s  %.2f%%  (%d/%d)%s  rate: %.2f %s/sec  remaining: %s hrs\n}"
+   .          "{%progress{20}{%sync-pos{}}{0}{%sync-size{}}}"
+   .          "{%sync-percent{}}"
+   .          "{%{amount}{ }{0}}"
+   .          "{%{amount}{ }{1}}"
+   .          "{%{amount}{ }{2}}"
+   .          "{%{rate}{ }{0}}"
+   .          "{%{rate}{ }{1}}"
+   .          "{%human-seconds{%sync-remain{}}}"
+   .  "%call{sync-line-1and1}",
+
+   "replinfo"
+   => "%let{amount}{%human-numbers{}{ }{ }{%replay-pos{}}{%fetch-size{}}}"
+   .  "%sprintf{     replaying: %s  %.2f%%  (%d/%d)%s  logs: [%d..%d]\n}"
+   .          "{%progress{20}{%replay-pos{}}{%fetch-pos{}}{%fetch-size{}}}"
+   .          "{%work-percent{}}"
+   .          "{%{amount}{ }{0}}"
+   .          "{%{amount}{ }{1}}"
+   .          "{%{amount}{ }{2}}"
+   .          "{%replay-lognr{}}"
+   .          "{%fetch-lognr{}}"
+   .  "%call{fetch-line}"
+   .  "%call{replay-line}",
+
+   "replinfo-1and1"
+   => "%let{amount}{%human-numbers{}{ }{ }{%replay-pos{}}{%fetch-size{}}}"
+   .  "%sprintf{     replaying: %s  %.2f%%  (%d/%d)%s  logs: [%d..%d]\n}"
+   .          "{%progress{20}{%replay-pos{}}{%fetch-pos{}}{%fetch-size{}}}"
+   .          "{%work-percent{}}"
+   .          "{%{amount}{ }{0}}"
+   .          "{%{amount}{ }{1}}"
+   .          "{%{amount}{ }{2}}"
+   .          "{%replay-lognr{}}"
+   .          "{%fetch-lognr{}}"
+   .  "%call{fetch-line-1and1}"
+   .  "%call{replay-line-1and1}",
+
+   "sync-line"
+   => "%let{amount}{%human-numbers{}{}{}{%sync-pos{}}{%sync-size{}}}"
+   .  "%let{rate}{%human-numbers{}{}{}{%sync-rate{}}}"
+   .  "%let{remain}{%human-seconds{%sync-remain{}}}"
+   .  "       > sync: %{amount} rate: %{rate}/sec  remaining: %{remain} hrs\n",
+
+   "sync-line-1and1"
+   => "%let{amount}{%human-numbers{}{}{}{%sync-pos{}}{%sync-size{}}}"
+   .  "%let{rate}{%human-numbers{}{}{}{%sync-rate{}}}"
+   .  "%let{remain}{%human-seconds{%sync-remain{}}}"
+   .  "       > sync: %{amount} rate: %{rate}/sec  remaining: %{remain} hrs\n",
+
+   "fetch-line"
+   => "%let{amount}{%human-numbers{}{}{}{%fetch-rest{}}}"
+   .  "%let{rate}{%human-numbers{}{}{}{%fetch-rate{}}}"
+   .  "%let{remain}{%human-seconds{%fetch-remain{}}}"
+   .  "%let{age}{%if{%and{%fetch-remain{}}{%>={%fetch-age{}}{%{window}}}}{ age: %human-seconds{%fetch-age{}}}}"
+   .  "%let{lag}{%if{%and{%fetch-remain{}}{%>={%fetch-lag{}}{%{window}}}}{ lag: %human-seconds{%fetch-lag{}}}}"
+   .  "       > fetch: %{amount}%{age}%{lag} rate: %{rate}/s remaining: %{remain}\n",
+
+   "fetch-line-1and1"
+   => "%let{amount}{%human-numbers{}{}{}{%fetch-rest{}}}"
+   .  "%let{rate}{%human-numbers{}{}{}{%fetch-rate{}}}"
+   .  "%let{remain}{%human-seconds{%fetch-remain{}}}"
+   .  "       > fetch: %{amount} rate: %{rate}/sec  remaining: %{remain} hrs\n",
+
+   "replay-line"
+   => "%let{amount}{%human-numbers{}{}{}{%replay-rest{}}}"
+   .  "%let{rate}{%human-numbers{}{}{}{%replay-rate{}}}"
+   .  "%let{remain}{%human-seconds{%replay-remain{}}}"
+   .  "%let{age}{%if{%and{%replay-remain{}}{%>={%replay-age{}}{%{window}}}}{ age: %human-seconds{%replay-age{}}}}"
+   .  "       > replay: %{amount}%{age} rate: %{rate}/s remaining: %{remain}\n",
+
+   "replay-line-1and1"
+   => "%let{amount}{%human-numbers{}{}{}{%replay-rest{}}}"
+   .  "%let{rate}{%human-numbers{}{}{}{%replay-rate{}}}"
+   .  "%let{remain}{%human-seconds{%replay-remain{}}}"
+   .  "       > replay: %{amount} rate: %{rate}/sec  remaining: %{remain} hrs\n",
+
+   "resource-errors"
+   => "%let{fat-count}{%get-resource-fat-count{}}"
+   .  "%if{%{fat-count}}{"
+   .    "FATALS   FILE (%{fat-count})"
+   .    "%if{%{verbose}}{"
+   .      ":\n%get-resource-fat{}"
+   .    "}{"
+   .      ": available with --verbose\n"
+   .    "}"
+   .  "}"
+
+   .  "%let{errs}{%the-err-count{}}"
+   .  "%if{%{errs}}{"
+   .    "ERRORS   LNK  (%{errs}):\n"
+   .    "%the-pretty-err-msg{}"
+   .  "}"
+
+   .  "%let{err-count}{%get-resource-err-count{}}"
+   .  "%if{%{err-count}}{"
+   .    "ERRORS   FILE (%{err-count})"
+   .    "%if{%{verbose}}{"
+   .      ":\n%get-resource-err{}"
+   .    "}{"
+   .      ": available with --verbose\n"
+   .    "}"
+   .  "}"
+
+   .  "%let{wrns}{%the-wrn-count{}}"
+   .  "%if{%{wrns}}{"
+   .    "WARNINGS LNK  (%{wrns}):\n"
+   .    "%the-pretty-wrn-msg{}"
+   .  "}"
+
+   .  "%let{wrn-count}{%get-resource-wrn-count{}}"
+   .  "%if{%and{%{verbose}}{%{wrn-count}}}{"
+   .    "WARNINGS FILE (%{wrn-count})"
+   .    "%if{%{verbose}}{"
+   .      ":\n%get-resource-wrn{}"
+   .    "}{"
+   .      ": available with --verbose\n"
+   .    "}"
+   .  "}"
+
+   .  "%let{infs}{%the-inf-count{}}"
+   .  "%if{%and{%{verbose}}{%{infs}}}{"
+   .    "INFOS    LNK  (%{infs}):\n"
+   .    "%the-pretty-inf-msg{}"
+   .  "}"
+
+   .  "%let{status_msg}{%get-log-status-{}}"
+   .  "%if{%and{%{verbose}}{%{status_msg}}}{"
+   .    "STATUS   FILE:\n%{status_msg}"
+   .  "}",
+
+
+   "resource-errors-1and1"
+   => "%let{fat-count}{%get-resource-fat-count{}}"
+   .  "%if{%{fat-count}}{"
+   .    "FATALS   FILE (%{fat-count}):\n"
+   .    "%get-resource-fat{}"
+   .  "}"
+
+   .  "%let{errs}{%the-err-count{}}"
+   .  "%if{%{errs}}{"
+   .    "ERRORS   LNK  (%{errs}):\n"
+   .    "%the-pretty-err-msg{}"
+   .  "}"
+
+   .  "%let{err-count}{%get-resource-err-count{}}"
+   .  "%if{%{err-count}}{"
+   .    "ERRORS   FILE (%{err-count}):\n"
+   .    "%get-resource-err{}"
+   .  "}"
+
+   .  "%let{wrns}{%the-wrn-count{}}"
+   .  "%if{%{wrns}}{"
+   .    "WARNINGS LNK  (%{wrns}):\n"
+   .    "%the-pretty-wrn-msg{}"
+   .  "}"
+
+   .  "%let{wrn-count}{%get-resource-wrn-count{}}"
+   .  "%if{%and{%{verbose}}{%{wrn-count}}}{"
+   .    "WARNINGS FILE (%{wrn-count})"
+   .    "%if{%{verbose}}{"
+   .      ":\n%get-resource-wrn{}"
+   .    "}{"
+   .      ": available with --verbose\n"
+   .    "}"
+   .  "}"
+
+   .  "%let{infs}{%the-inf-count{}}"
+   .  "%if{%and{%{verbose}}{%{infs}}}{"
+   .    "INFOS    LNK  (%{infs}):\n"
+   .    "%the-pretty-inf-msg{}"
+   .  "}"
+
+   .  "%let{status_msg}{%get-log-status-{}}"
+   .  "%if{%and{%{verbose}}{%{status_msg}}}{"
+   .    "STATUS   FILE:\n%{status_msg}"
+   .  "}",
+
+   "comminfo"
+   => "%let{txt}{%the-pretty-global-msg{}}"
+   .  "%let{txt}{%subst{%{txt}}{^.*CONNECTED.*\$\n*}{}{mg}}"
+   .  "%if{%{txt}}{"
+   .    "++++++++++++ Global / Communication Status ++++++++++++\n"
+   .    "%{txt}"
+   .  "}",
+
+   # drbd similar ones
+   "state"
+   => "NYI Please override macro \\%%{0}\\{\\}",
+   "cstate"
+   => "NYI Please override macro \\%%{0}\\{\\}",
+   "dstate"
+   => "NYI Please override macro \\%%{0}\\{\\}",
+   "status"
+   => "NYI Please override macro \\%%{0}\\{\\}",
+  );
+
+my %view_macros = %complex_macros;
+
+# add some trivial macros to the command line interface
+# FIXME: only at most one argument is allowed for now.
+my %trivial_globs =
+  (
+
+   # intended for human use
+   "{all,the}-{pretty-,}{global-,}{{err,wrn,inf}-,}msg"
+   => "",
+   "{is,todo}-{attach,sync,fetch,replay,primary}"
+   => "",
+   "is-{split-brain,consistent,emergency}"
+   => "",
+   "rest-space"
+   => "",
+   "get-{disk,device}"
+   => "",
+   "present-{disk,device}"
+   => "(deprecated, use *-present instead)",
+   "{disk,device}-present"
+   => "",
+   "device-opened"
+   => "",
+   "get-log-status"
+   => "",
+   "get-resource-{fat,err,wrn}{,-count}"
+   => "",
+
+   # intended for scripting
+   "{my,all}-resources"
+   => "",
+   "{cluster,resource}-members"
+   => "",
+   "{disk,resource,device}-size"
+   => "",
+   "deletable-size"
+   => "",
+   "occupied-size"
+   => "",
+   "replay-code"
+   => "When negative, this indidates that a replay/recovery error has occurred.",
+   "errno-text"
+   => "Convert errno numbers (positive or negative) into human readable text.",
+   "{sync,fetch,replay,work,syncpos}-{size,pos}"
+   => "",
+   "{sync,fetch,replay,work}-{rest,{almost-,threshold-,}reached,percent,permille,vector}"
+   => "",
+   "{sync,fetch,replay}-{rate,remain}"
+   => "",
+   "summary-vector",
+   => "",
+   "{alive,fetch,replay,work}-{timestamp,age,lag}"
+   => "",
+
+
+   "{get,actual}-primary"
+   => "",
+   "is-{alive}"
+   => "",
+   "uuid"
+   => "",
+   "tree"
+   => "",
+
+
+   "wait-{is,todo}-{attach,sync,fetch,replay,primary}-{on,off}"
+   => "",
+  );
+
+my $glob = "";
+foreach my $new_glob (sort(keys(%trivial_globs))) {
+  $glob .= "," if $glob;
+  $glob .= $new_glob;
+}
+foreach my $name (glob("{$glob}")) {
+  $view_macros{$name} = "\%primitive-$name\{\%\{1}}";
+}
+
+sub _get_pre {
+  my ($rest, $add) = @_;
+  $rest =~ s{(\A.*\n)}{}sp;
+  $add = 0 if $1;
+  return length($rest) + $add;
+}
+
+sub _break_line {
+  my ($result, $add, $indent) = @_;
+  my $pre_len = _get_pre($result, $add);
+  if ($pre_len != $indent) {
+    $result .= "\\\n" . ' ' x $indent;
+  }
+  return $result;
+}
+
+sub _pretty_macro {
+  my ($text, $add, $indent) = @_;
+  $text =~ s/\\n/\n/gs;
+  my $result = "";
+  # look for function calls
+  while ($text =~ m/^($match_fn_head(?:{})*)/mp) {
+    $result .= $PREMATCH;
+    my $fn = $1;
+    $text = $POSTMATCH;
+    $result = _break_line($result, $add, $indent);
+    $add = 0;
+    $result .= $fn;
+    while ($text =~ m/\A\{/sp) {
+      # don't break simple / non-recursive / unbreakable arguments
+      if ($text =~ m/\A(\{(?:\s$match_inner|[^%{}]*)\})/sp) {
+	my $shortcut = $1;
+	$text = $POSTMATCH;
+	# make newlines non-verbatim
+	$shortcut =~ s{\n}{\\n}spg;
+	$result .= $shortcut;
+	next;
+      }
+      # break more complex arguments
+      #$result .= "{\\\n" . ' ' x $indent;
+      $result .= "{";
+      if ($text =~ m/\A\{([\s]$match_inner|)\}/sp) {
+	$result .= "$1}";
+	$text = $POSTMATCH;
+      } elsif ($text =~ m/\A\{([^\s]$match_inner)\}/sp ) {
+	my $arg = $1;
+	$text = $POSTMATCH;
+	my $sub_add = _get_pre($result, 0);
+	my $subst = _pretty_macro($arg, $sub_add, $indent + 2);
+	$result .= $subst;
+	$result = _break_line($result, 0, $indent);
+	$result .= "}";
+      } else {
+	ldie "wtf '$text'?\n";
+      }
+    }
+  }
+  $result .= $text;
+  return $result;
+}
+
+sub pretty_macro {
+  my $txt = _pretty_macro(@_);
+  # always add a trailing newline (for vi ;)
+  $txt .= "\\\n" unless $txt =~ m{\n\Z}sp;
+  return $txt;
+}
+
+if (defined($ARGV[0]) && $ARGV[0] =~ m/^dump-(all-)?macros$/) {
+  my %macros = %complex_macros;
+  %macros = %view_macros if defined($1);
+  foreach my $name (keys %macros) {
+    my $txt = $macros{$name};
+    $txt = pretty_macro($txt, 0, 0);
+    my $file = "$name.tpl";
+    if (-r $file) { # backup already existing files
+      for (my $i = 0; ; $i++) {
+	my $file_old = "$file.old$i";
+	unless (-r $file_old) {
+	  rename($file, $file_old);
+	  last;
+	}
+      }
+    }
+    open(OUT, ">", $file) or ldie "cannot create file '$file'\n";
+    print OUT $txt;
+    close(OUT);
+  }
+  exit(0);
+}
+
+sub get_macro {
+  my ($cmd, $tolerate) = @_;
+  if ($macro) {
+    my $orig = $macro;
+    $macro = ""; # consume once
+    return $orig;
+  }
+  foreach my $path (".", "~/.marsadm", "/etc/marsadm") {
+    my $file = "$path/$cmd.tpl";
+    if (-r $file) {
+      lprint_stderr "using macro file '$file'\n" if (defined($view_macros{$cmd}));
+      local $/;  # slurp
+      open(IN, "<", $file) or next;
+      my $tpl = <IN>;
+      close(IN);
+      $tpl =~ s{$match_comment}{}sg;
+      $tpl =~ s{\\n}{\n}sg;
+      return $tpl;
+    }
+  }
+  return $view_macros{$cmd} if (defined($view_macros{$cmd}));
+  ldie "cannot find macro '$cmd'\n" unless defined($tolerate);
+  return "";
+}
+
+sub view_cmd {
+  my ($cmd, $res) = (shift, shift);
+  if ($cmd =~ s/^prettyprint-//) {
+    my $txt = get_macro($cmd);
+    print pretty_macro($txt, 0);
+    return;
+  }
+  $cmd =~ s/^view-?//;
+  $cmd = "default" unless $cmd;
+  my $tpl = get_macro($cmd);
+  my $result = eval_macro($cmd, $res, $tpl, @_);
+  if ($result ne "") { # add trailing newline if none exists
+    chomp $result;
+    $result .= "\n";
+  }
+  print $result;
+}
+
+##################################################################
+
+# command table of all commands
+
 my %cmd_table =
   (
    # new keywords
-   "create-cluster"     => \&create_cluster,
-   "join-cluster"       => \&join_cluster,
-   "leave-cluster"      => \&leave_cluster,
-   "create-resource"   => \&create_res,
-   "join-resource"     => \&create_res,
-   "leave-resource"    => \&leave_res,
-   "log-rotate"        => \&logrotate_res,
-   "log-delete"        => \&logdelete_res,
-   "log-delete-all"    => \&logdelete_res,
-   "fake-sync"         => \&fake_local_res,
+   "create-uuid"
+   => [
+       "verbose 3",
+       "usage: create-uuid (no parameters)",
+       "Deprecated.",
+       "This is only needed if you have a very old $mars/",
+       "directory structure from MARS version light0.1beta05",
+       "or earlier.",
+       \&create_uuid,
+      ],
+   "create-cluster"
+   => [
+       "usage: create-cluster (no parameters)",
+       "This must be called exactly once when creating a new cluster.",
+       "Don't call this again! Use join-cluster on the secondary nodes.",
+       "Please read the PDF manual for details.",
+       \&create_cluster,
+      ],
+   "join-cluster"
+   => [
+       "usage: join-cluster <hostname_of_primary>",
+       "Establishes a new cluster membership.",
+       "This must be called once on any new cluster member.",
+       "This is a prerequisite for join-resource.",
+       \&join_cluster,
+      ],
+   "leave-cluster"
+   => [
+       "usage: leave-cluster (no parameters)",
+       "This can be used for final deconstruction of a cluster member.",
+       "Prior to this, all resources must have been left",
+       "via leave-resource.",
+       "Notice: this will never destroy the cluster UID on the /mars/",
+       "filesystem.",
+       "Please read the PDF manual for details.",
+       \&leave_cluster,
+      ],
+   "create-resource"
+   => [
+       "usage: create-resource <resource_name> </dev/lv/mydata>",
+       "(further syntax variants are described in the PDF manual).",
+       "Create a new resource out of a pre-existing disk (backing",
+       "block device) /dev/lv/mydata (or similar).",
+       "The current node will start in primary role, thus",
+       "/dev/mars/<resource_name> will appear after a short time, initially",
+       "showing the same contents as the underlying disk /dev/lv/mydata.",
+       "It is good practice to name the resource <resource_name> and the",
+       "disk name identical.",
+       \&create_res,
+      ],
+   "join-resource"
+   => [
+       "usage: join-resource <resource_name> </dev/lv/mydata>",
+       "(further syntax variants are described in the PDF manual).",
+       "The resource <resource_name> must have been already created on",
+       "another cluster node, and the network must be healthy.",
+       "The contents of the local replica disk /dev/lv/mydata will be",
+       "overwritten by the initial fast full sync from the currently",
+       "designated primary node.",
+       "After the initial full sync has finished, the current host will",
+       "act in secondary role.",
+       "For details on size constraints etc, refer to the PDF manual.",
+       \&create_res,
+      ],
+   "leave-resource"
+   => [
+       "Precondition: the local host must be in secondary role.",
+       "Stop being a member of the resource, and thus stop all",
+       "replication activities. The status of the underlying disk",
+       "will remain in its current state (whatever it is).",
+       \&leave_res_phase0,
+       "check preconditions",
+       \&leave_res_phase1,
+       "switch state",
+       \&leave_res_phase2,
+       "wait for deletions",
+      ],
+   "delete-resource"
+   => [
+       "CAUTION! This is dangerous when the network is somehow",
+       "interrupted, or when damaged nodes are later re-surrected",
+       "in any way.\n",
+       "Precondition: the resource must no longer have any members",
+       "(see leave-resource).",
+       "This is only needed when you _insist_ on re-using a damaged",
+       "resource for re-creating a new one with exactly the same",
+       "old <resource_name>.",
+       "HINT: best practice is to not use this, but just create a _new_",
+       "resource with a new <resource_name> out of your local disks.",
+       "Please read the PDF manual on potential consequences.",
+       \&delete_res,
+      ],
+   "set-connect-pref-list"
+   => [
+       "verbose 2",
+       "usage: set-connect-pref-list <resource_name> <host_list>",
+       "Provisionary command for internal use at 1&1. Will be replaced by",
+       "a better concept somewhen. The <host_list> must be comma-separated.",
+       \&set_connect_pref_list,
+      ],
+   "get-connect-pref-list"
+   => [
+       "verbose 2",
+       "Provisionary command for internal use at 1&1. Will be replaced by",
+       "a better concept somewhen.",
+       "Shows the outcome of set-connect-pref-list.",
+       \&set_connect_pref_list,
+      ],
+   "log-rotate"
+   => [
+       "Only useful at the primary side.",
+       "Start writing transaction logs into a new transaction logfile.",
+       "This must be regularly called by a cron job or similar.",
+       "For details and best practices, please refer to the PDF manual.",
+       \&logrotate_res,
+      ],
+   "log-delete"
+   => [
+       "When possible, globally delete at most one old transaction logfile",
+       "which is known to be superfluous, i.e. all secondaries no longer",
+       "need to replay it.",
+       "Hint: use this only for testing and manual inspection.",
+       "For regular maintainance cron jobs, please prefer log-delete-all.",
+       \&logdelete_res,
+      ],
+   "log-delete-all"
+   => [
+       "When possible, globally delete all old transaction logfiles which",
+       "are known to be superflous, i.e. all secondaries no longer need",
+       "to replay them.",
+       "This must be regularly called by a cron job or similar, in order",
+       "to prevent overflow of the /mars/ directory.",
+       "For details and best practices, please refer to the PDF manual.",
+       \&logdelete_res,
+      ],
+   "log-purge-all"
+   => [
+       "This is potentially dangerous.",
+       "Use this only if you are really desperate in trying to resolve a",
+       "split brain. Use this only after reading the PDF manual!",
+       \&log_purge_res,
+      ],
+   "fake-sync"
+   => [
+       "verbose 1",
+       "Attention: this is potentially dangerous.",
+       "Only for experts.",
+       "Please read the PDF manual to understand the risks!",
+       \&fake_sync_phase1,
+       "switch sync off",
+       \&fake_sync_phase2,
+       "wait for sync off",
+       \&fake_sync_phase3,
+       "fake sync",
+      ],
+   "set-link"
+   => [
+       "verbose 1",
+       "usage: set-link <path> <value>",
+       "Only for experts.",
+       "Will disappear in a future MARS release.",
+       \&set_link_cmd,
+      ],
+   "get-link"
+   => [
+       "verbose 1",
+       "usage: get-link <path>",
+       "Only for experts.",
+       "Will disappear in a future MARS release.",
+       \&set_link_cmd,
+      ],
+   "set-sync-pref-list"
+   => [
+       "verbose 2",
+       "usage: set-sync-pref-list <resource_name> <host_list>",
+       "Provisionary command for internal use at 1&1. Will be replaced by",
+       "a better concept somewhen. The <host_list> must be comma-separated.",
+       \&set_sync_pref_list,
+      ],
+   "get-sync-pref-list"
+   => [
+       "verbose 2",
+       "Provisionary command for internal use at 1&1. Will be replaced by",
+       "a better concept somewhen. Shows the outcome of set-sync-pref-list.",
+       \&set_sync_pref_list,
+      ],
+   "set-sync-limit-value"
+   => [
+       "usage: set-sync-limit-value <new_value>",
+       "Set the maximum number of resources which should by syncing",
+       "concurrently.",
+       \&set_sync_limit_value,
+      ],
+   "get-sync-limit-value"
+   => [
+       "usage: get-sync-limit-value (no parameters)",
+       "For retrieval of the value set by set-sync-limit-value.",
+       \&set_sync_limit_value,
+      ],
+   "delete-file"
+   => [
+       "verbose 1",
+       "usage: delete-file <path>",
+       "VERY dangerous!",
+       "Only for experts.",
+       \&delete_file_cmd,
+      ],
+   "set-emergency-limit"
+   => [
+       "usage: set-emergency-limit <resource_name> <value>",
+       "Set a per-resource emergency limit for disk space in /mars.",
+       "See PDF manual for details.",
+       \&emergency_limit_res,
+      ],
+   "get-emergency-limit"
+   => [
+       "Counterpart of set-emergency-limit (per-resource emergency limit)",
+       \&emergency_limit_res,
+      ],
+   "emergency-limit"   => \&emergency_limit_res,
+   "cat"
+   => [
+       "usage: cat <path>",
+       "Print internal debug output in human readable form.",
+       "Numerical timestamps and numerical error codes are replaced",
+       "by more readable means.",
+       "Example: marsadm cat /mars/5.total.status",
+       \&cat_cmd,
+      ],
+   "show"
+   => [
+       "verbose 3",
+       "Deprecated old low-level tool. Don't use. Use macros instead.",
+       \&show_cmd,
+      ],
+   "show-errors"
+   => [
+       "verbose 3",
+       "Deprecated old low-level tool. Don't use. Use macros instead.",
+       \&show_errors_cmd,
+      ],
+   "show-state"
+   => [
+       "verbose 3",
+       "Deprecated old low-level tool. Don't use. Use macros instead.",
+       \&mars_state_cmd,
+      ],
+   "mars-state"        => \&mars_state_cmd, # deprecated
+   "show-info"
+   => [
+       "verbose 3",
+       "Deprecated old low-level tool. Don't use. Use macros instead.",
+       \&mars_info_cmd,
+      ],
+   "mars-info"         => \&mars_info_cmd, # deprecated
+   "pause-replay-local"
+   => [
+       "Stop replaying transaction logfiles for now.",
+       "This is independent from any {pause,resume}-fetch operations.",
+       "This may be used for freezing the state of your replica for some",
+       "time, if you have enough space on /mars/.",
+       "Only useful on a secondary node.",
+       \&pause_replay_local_res,
+      ],
+   "pause-replay-global"
+   => [
+       "Like pause-replay-local, but affects all resource members",
+       "in the cluster (remotely).",
+       \&pause_replay_global_res,
+      ],
+   "pause-replay"
+   => [
+       "See pause-replay-local.",
+       \&pause_replay_local_res,
+      ],
+   "resume-replay-local"
+   => [
+       "Restart replaying transaction logfiles, when there is some",
+       "data left.",
+       "This is independent from any {pause,resume}-fetch operations.",
+       "This should be used for unfreezing the state of your local replica.",
+       "Only useful on a secondary node.",
+       \&pause_replay_local_res,
+      ],
+   "resume-replay-global"
+   => [
+       "Like resume-replay-local, but affects all resource members",
+       "in the cluster (remotely).",
+       \&pause_replay_global_res,
+      ],
+   "resume-replay"
+   => [
+       "See resume-replay-local.",
+       \&pause_replay_local_res,
+      ],
+   "set-replay"
+   => [
+       "verbose 1",
+       "VERY dangerous!",
+       "Only for experts.",
+       \&set_replay_res,
+      ],
+   "wait-umount"
+   => [
+       "Wait until /dev/mars/<resource_name> has disappeared in the",
+       "cluster (even remotely).",
+       "Useful on both primary and secondary nodes.",
+       \&wait_umount_res,
+      ],
+   "wait-cluster"
+   => [
+       "usage: wait-resource [<resource_name>]",
+       "Waits until a ping-pong communication has succeeded in the",
+       "whole cluster (or only the members of <resource_name>).",
+       "NOTICE: this is extremely useful for avoiding races when scripting",
+       "in a cluster.",
+       \&wait_cluster,
+      ],
+   "wait-resource"
+   => [
+       "usage: wait-resource <resource_name>",
+       "                     [[attach|fetch|replay|sync][-on|-off]]",
+       "Wait until the given condition is met on the resource, locally.",
+       \&wait_cond,
+      ],
 
-   # compatible keywords
-   "attach"            => \&attach_res,
-   "detach"            => \&attach_res,
-   "connect"           => \&connect_res,
-   "disconnect"        => \&connect_res,
-   "connect-local"     => \&connect_local_res,
-   "disconnect-local"  => \&connect_local_res,
+   # compatible keywords (or their derivatives)
+   "attach"
+   => [
+       "Attaches the local disk (backing block device) to the resource.",
+       "The disk must have been previously configured at",
+       "{create,join}-resource.",
+       "When designated as a primary, /dev/mars/\$res will also appear.",
+       "This does not change the state of {fetch,replay}.",
+       "For a complete local startup of the resource, use 'marsadm up'.",
+       \&attach_res_phase0,
+       "check preconditions",
+       \&attach_res_phase1,
+       "switch state",
+       \&attach_res_phase2,
+       "wait for effect",
+      ],
+   "detach"
+   => [
+       "Detaches the local disk (backing block device) from the",
+       "MARS resource.",
+       "Caution! you may read data from the local disk afterwards,",
+       "but ensure that no data is written to it!",
+       "Otherwise, you are likely to produce harmful inconsistencies.",
+       "When running in primary role, /dev/mars/\$res will also disappear.",
+       "This does not change the state of {fetch,replay}.",
+       "For a complete local shutdown of the resource, use 'marsadm down'.",
+       \&attach_res_phase0,
+       "check preconditions",
+       \&attach_res_phase1,
+       "switch state",
+       \&attach_res_phase2,
+       "wait for effect",
+      ],
+   "resume-fetch-local"
+   => [
+       "Start fetching transaction logfiles from the current",
+       "designated primary node, if there is one.",
+       "This is independent from any {pause,resume}-replay operations.",
+       "Only useful on a secondary node.",
+       \&fetch_local_res,
+      ],
+   "resume-fetch-global"
+   => [
+       "Like resume-fetch-local, but affects all resource members",
+       "in the cluster (remotely).",
+       \&fetch_global_res,
+      ],
+   "resume-fetch"
+   => [
+       "See resume-fetch-local.",
+       \&fetch_local_res,
+      ],
+   "pause-fetch-local"
+   => [
+       "Stop fetching transaction logfiles from the current",
+       "designated primary.",
+       "This is independent from any {pause,resume}-replay operations.",
+       "Only useful on a secondary node.",
+       \&fetch_local_res,
+      ],
+   "pause-fetch-global"
+   => [
+       "Like pause-fetch-local, but affects all resource members",
+       "in the cluster (remotely).",
+       \&fetch_global_res,
+      ],
+   "pause-fetch"
+   => [
+       "See pause-fetch-local.",
+       \&fetch_local_res,
+      ],
+   "connect-local"
+   => [
+       "See resume-fetch-local.",
+       \&fetch_local_res,
+      ],
+   "connect-global"
+   => [
+       "Like resume-fetch-local, but affects all resource members",
+       "in the cluster (remotely).",
+       \&fetch_global_res,
+      ],
+   "connect"
+   => [
+       "See resume-fetch-local.",
+       \&fetch_local_res,
+      ],
+   "disconnect-local"
+   => [
+       "See pause-fetch-local.",
+       \&fetch_local_res,
+      ],
+   "disconnect-global"
+   => [
+       "Like pause-fetch-local, but affects all resource members",
+       "in the cluster (remotely).",
+       \&fetch_global_res,
+      ],
+   "disconnect"
+   => [
+       "See pause-fetch-local.",
+       \&fetch_local_res,
+      ],
    "syncer"            => \&ignore_cmd,
-   "up"                => \&up_res,
-   "down"              => \&up_res,
-   "primary"           => \&primary_res,
-   "secondary"         => \&primary_res,
-   "invalidate"        => \&invalidate_res,
+   "up"
+   => [
+       "Shortcut for attach + resume-sync + resume-fetch + resume-replay.",
+       \&up_res_phase0,
+       "check preconditions",
+       \&up_res_phase1,
+       "switch state",
+       \&up_res_phase2,
+       "wait for effect",
+      ],
+   "down"
+   => [
+       "Shortcut for detach + pause-sync + pause-fetch + pause-replay.",
+       \&up_res_phase0,
+       "check preconditions",
+       \&up_res_phase1,
+       "switch state",
+       \&up_res_phase2,
+       "wait for effect",
+      ],
+   "primary"
+   => [
+       "Promote the resource into primary role.",
+       "This is necessary for /dev/mars/\$res to appear on the local host.",
+       "Notice: by concept there can be only _one_ designated primary",
+       "in a cluster at the same time.",
+       "The role change is automatically distributed to the other nodes",
+       "in the cluster, provided that the network is healthy.",
+       "The old primary node will _automatically_ go",
+       "into secondary role first. This is different from DRBD!",
+       "With MARS, you don't need an intermediate 'secondary' command",
+       "for switching roles.",
+       "It is usually better to _directly_ switch the primary roles",
+       "between both hosts.",
+       "When --force is not given, a planned handover is started:",
+       "the local host will only become actually primary _after_ the",
+       "old primary is gone, and all old transaction logs have been",
+       "fetched and replayed at the new designated priamry.",
+       "When --force is given, no handover is attempted. A a consequence,",
+       "a split brain situation is likely to emerge.",
+       "Thus, use --force only after an ordinary handover attempt has",
+       "failed, and when you don't care about the split brain.",
+       "For more details, please refer to the PDF manual.",
+       \&primary_phase0,
+       "check preconditions",
+       \&primary_phase1,
+       "leave primary state",
+       \&primary_phase2,
+       "wait when necessary",
+       \&primary_phase3,
+       "switch to primary",
+       \&primary_phase4,
+       "wait for device",
+      ],
+   "secondary"
+   => [
+       "Promote all cluster members into secondary role, globally.",
+       "In contrast to DRBD, this is not needed as an intermediate step",
+       "for planned handover between an old and a new primary node.",
+       "The only reasonable usage is before the last leave-resource of the",
+       "last cluster member, immediately before leave-cluster is executed",
+       "for final deconstruction of the cluster.",
+       "In all other cases, please prefer 'primary' for direct handover",
+       "between cluster nodes.",
+       "Notice: 'secondary' sets the global designated primary node",
+       "to '(none)' which in turn prevents the execution of 'invalidate'",
+       "or 'join-resource' or 'resize' anywhere in the cluster.",
+       "Therefore, don't unnecessarily give 'secondary'!",
+       \&primary_phase0,
+       "check preconditions",
+       \&primary_phase1,
+       "leave primary state",
+       \&primary_phase4,
+       "wait for effect",
+      ],
+   "invalidate"
+   => [
+       "Only useful on a secondary node.",
+       "Forces MARS to consider the local replica disk as being",
+       "inconsistent, and therefore starting a fast full-sync from",
+       "the currently designated primary node (which must exist;",
+       "therefore avoid the 'secondary' command).",
+       "This is usually needed for resolving emergency mode.",
+       "When having k=2 replicas, this can be also used for",
+       "quick-and-simple split-brain resolution.",
+       "In other cases, or when the split-brain is not resolved by",
+       "this command, please use the 'leave-resource' / 'join-resource'",
+       "method as described in the PDF manual (in the right order as",
+       "described there).",
+       \&invalidate_res_phase0,
+       "check preconditions",
+       \&invalidate_res_phase1,
+       "stop old replay",
+       \&invalidate_res_phase2,
+       "wait for replay off",
+       \&invalidate_res_phase3,
+       "force symlinks",
+      ],
    "invalidate-remote" => \&forbidden_cmd,
-   "resize"            => \&resize_res,
+   "resize"
+   => [
+       "Prerequisite: all underlying disks (usually /dev/vg/\$res) must",
+       "have been already increased, e.g. at the LVM layer (cf. lvresize).",
+       "Causes MARS to re-examine all sizing constraints on all members of",
+       "the resource, and increase the global logical size of the resource",
+       "accordingly.",
+       "Shrinking is currently not yet implemented.",
+       "When successful, /dev/mars/\$res at the primary will be increased",
+       "in size. In addition, all secondaries will start an incremental",
+       "fast full-sync to get the enlarged parts from the primary.",
+       \&resize_phase0,
+       "check preconditions",
+       \&resize_phase1,
+       "set new size",
+       \&resize_phase2,
+       "wait for change",
+      ],
+   "check-resize"      => \&ignore_cmd,
    "create-md"         => \&senseless_cmd,
    "get-gi"            => \&ignore_cmd,
    "show-gi"           => \&ignore_cmd,
    "dump-md"           => \&senseless_cmd,
    "outdate"           => \&ignore_cmd,
    "adjust"            => \&ignore_cmd,
-   "wait-connect"      => \&nyi_cmd,
-   "role"              => \&role_cmd,
-   "state"             => \&role_cmd,
+   "wait-connect"
+   => [
+       "usage: wait-connect [<resource_name>]",
+       "See wait-cluster.",
+       \&wait_cluster,
+      ],
+   "role"
+   => [
+       "verbose 3",
+       "Deprecated.",
+       "Please use the macro command 'view-role' instead.",
+       "For even better summary information, use plain 'view'.",
+       \&role_cmd,
+      ],
+   "state"
+   => [
+       "verbose 3",
+       "Deprecated.",
+       "Please use the macro command 'view-role' instead.",
+       "For even better summary information, use plain 'view'.",
+       \&role_cmd,
+      ],
    "cstate"            => \&nyi_cmd,
+   "dstate"            => \&nyi_cmd,
    "status"            => \&nyi_cmd,
    "dump"              => \&senseless_cmd,
-   "verify"            => \&nyi_cmd,
-   "pause-sync"        => \&pause_sync_res,
-   "resume-sync"       => \&pause_sync_res,
-   "pause-sync-local"  => \&pause_sync_local_res,
-   "resume-sync-local" => \&pause_sync_local_res,
-   "pause-replay"        => \&pause_replay_res,
-   "resume-replay"       => \&pause_replay_res,
-   "pause-replay-local"  => \&pause_replay_local_res,
-   "resume-replay-local" => \&pause_replay_local_res,
+   "verify"            => \&forbidden_cmd,
+   "pause-sync-local"
+   => [
+       "Pause the initial data sync at current stage.",
+       "This has only an effect if a sync is actually running (i.e.",
+       "there is something to be actually synced).",
+       "Don't pause too long, because the local replica will remain",
+       "inconsistent during the pause.",
+       "Use this only for limited reduction of system load.",
+       "Only useful on a secondary node.",
+       \&pause_sync_local_res,
+      ],
+   "pause-sync-global"
+   => [
+       "Like pause-sync-local, but affects all resource members",
+       "in the cluster (remotely).",
+       \&pause_sync_global_res,
+      ],
+   "pause-sync"
+   => [
+       "See pause-sync-local.",
+       \&pause_sync_local_res,
+      ],
+   "resume-sync-local"
+   => [
+       "Resume any initial / incremental data sync at the stage where it",
+       "had been interrupted by pause-sync.",
+       "Only useful on a secondary node.",
+       \&pause_sync_local_res,
+      ],
+   "resume-sync-global"
+   => [
+       "Like resume-sync-local, but affects all resource members",
+       "in the cluster (remotely).",
+       \&pause_sync_global_res,
+      ],
+   "resume-sync"
+   => [
+       "See resume-sync-local.",
+       \&pause_sync_local_res,
+      ],
    "new-current-uuid"  => \&senseless_cmd,
-   "dstate"            => \&nyi_cmd,
    "hidden-commands"   => \&ignore_cmd,
+
+   # lowlevel tools
+   "lowlevel-ls-host-ips"
+   => [
+       "List cluster member names and IP addresses.",
+       \&lowlevel_ls_host_ips,
+      ],
+   "lowlevel-set-host-ip"
+   => [
+       "Set IP for host.",
+       \&lowlevel_set_host_ip,
+      ],
+   "lowlevel-delete-host"
+   => [
+       "Delete cluster member.",
+       \&lowlevel_delete_host,
+      ],
   );
+
+
+sub helplist {
+  my $msg = shift;
+  print "ERROR: $msg" if ($msg);
+  print "
+Thorough documentation is in mars-manual.pdf. Please use the PDF manual
+as authoritative reference! Here is only a short summary of the most
+important sub-commands / options:
+
+marsadm [<global_options>] <command> [<resource_name> | all | <args> ]
+marsadm [<global_options>] view[-<macroname>] [<resource_name> | all ]
+
+<global_option> =
+  --force
+    Skip safety checks.
+    Use this only when you really know what you are doing!
+    Warning! This is dangerous! First try --dry-run.
+    Not combinable with 'all'.
+  --dry-run
+    Don't modify the symlink tree, but tell what would be done.
+    Use this before starting potentially harmful actions such as
+    'delete-resource'.
+  --verbose
+    Increase speakyness of some commands.
+  --logger=/path/to/usr/bin/logger
+    Use an alternative syslog messenger.
+    When empty, disable syslogging.
+  --timeout=<seconds>
+    Abort safety checks after timeout with an error.
+    When giving 'all' as resource agument, this works for each
+    resource independently.
+  --window=<seconds>
+    Treat other cluster nodes as healthy when some communcation has
+    occured during the given time window.
+  --threshold=<bytes>
+    Some macros like 'fetch-threshold-reached' use this for determining
+    their sloppyness.
+  --host=<hostname>
+    Act as if the command was running on cluster node <hostname>.
+    Warning! This is dangerous! First try --dry-run
+  --ip=<ip>
+    Override the IP address stored in the symlink tree, as well as
+    the default IP determined from the list of network interfaces.
+    Usually you will need this only at 'create-cluster' or
+    'join-cluster' for resolving ambiguities.
+  --macro=<text>
+    Handy for testing short macro evaluations at the command line.
+
+<command> =
+";
+  my $item_count = 0;
+  foreach my $cmdname (sort(keys(%cmd_table))) {
+    my $list = $cmd_table{$cmdname};
+    next unless ref($list) eq "ARRAY";
+    my @copy = @$list;
+    my $line_count = 0;
+    my $verb_level = 0;
+    while (my $txt = shift @copy) {
+      last if ref($txt) eq "CODE";
+      my $skip_this = 0;
+      if ($txt =~ m/^verbose *([0-9]+)/) {
+	$verb_level = $1;
+	$skip_this = 1;
+      }
+      if ($verbose < 0) {
+	last if $verb_level != -$verbose;
+      } else {
+	last if $verb_level > $verbose;
+      }
+      next if $skip_this;
+      if (!$line_count) {
+	print "\n" if $item_count++;
+	print "  $cmdname\n";
+	print "    usage: $cmdname <resource_name>\n" if $txt !~ m/usage:/;
+      }
+      print "    $txt\n";
+      $line_count++;
+    }
+  }
+
+  print "
+<resource_name> = name of resource or \"all\" for all resources
+";
+
+  print "
+
+<macroname> = <complex_macroname> | <primitive_macroname>
+
+<complex_macroname> =
+";
+  foreach my $macroname (sort(keys(%complex_macros))) {
+    print "  $macroname\n";
+  }
+
+  print "
+
+<primitive_macroname> =
+";
+  foreach my $glob (sort(keys(%trivial_globs))) {
+    my $txt = $trivial_globs{$glob};
+    print "  $glob\n";
+    print "    $txt\n" if $txt;
+  }
+
+  exit 0;
+}
 
 my @args;
 
 foreach my $arg (@ARGV) {
-  if($arg eq "--force") {
+  if ($arg eq "--force" || $arg eq "-f") {
     $force++;
     next;
+  } elsif ($arg eq "--dry-run" || $arg eq "-d") {
+    $dry_run++;
+    next;
+  } elsif ($arg =~ s/--verbose\s*=\s*(-?[0-9]+)/$1/) {
+    $verbose = $arg;
+    next;
+  } elsif ($arg eq "--verbose" || $arg eq "-v") {
+    $verbose++;
+    next;
+  } elsif ($arg =~ s/--logger\s*=\s*(.*)/$1/) {
+    $logger = $arg;
+    next;
+  } elsif ($arg =~ s/--timeout\s*=\s*([0-9]+)/$1/) {
+    $timeout = $arg;
+    next;
+  } elsif ($arg =~ s/--window\s*=\s*([0-9]+)/$1/) {
+    $window = $arg;
+    next;
+  } elsif ($arg =~ s/--threshold\s*=\s*([0-9]+)/$1/) {
+    $threshold = get_size($arg);
+    next;
+  } elsif ($arg =~ s/--host\s*=\s*([-_A-Za-z0-9]+)/$1/) {
+    check_id($arg, 1);
+    if ($arg ne $host) {
+      lprint "ATTENTION: acting as if I were host '$arg'\n";
+      lwarn "some commands require local knowledge not available here.\n";
+      lwarn "thus something may fail or go wrong - use this at your risk!\n";
+      $host = $arg;
+    }
+    next;
+  } elsif ($arg =~ s/--ip\s*=\s*([0-9.:\[\]]+)/$1/) {
+    $ip = $arg;
+    lprint_stderr "Using IP '$ip' from command line.\n";
+    next;
+  } elsif ($arg =~ s/--macro\s*=\s*(.*)/$1/) {
+    $macro = $arg;
+    $macro =~ s/\\n/\n/mg;
+    next;
+  } elsif ($arg =~ m/^--help$/ || $arg =~ m/^-h$/) {
+    helplist;
+    next;
+  } elsif ($arg =~ m/^--version$/ || $arg =~ m/^-v$/) {
+    version;
+    next;
+  } elsif ($arg =~ m/^-(.*)/) {
+    ldie "unrecognized argument '-$1' (bad syntax)\n";
   }
-  if($arg =~ s/^force-//) {
+  if ($arg =~ s/^force-//) {
     $force++;
   }
   push @args, $arg;
@@ -983,48 +5137,173 @@ foreach my $arg (@ARGV) {
 
 my $cmd = shift @args || helplist "command argument is missing\n";
 
-$notify = "(cmd: $cmd)" unless $cmd eq "version";
-
-if($cmd =~ m/^help$/ || $cmd =~ m/^h$/) {
+if ($cmd =~ m/^help$/ || $cmd =~ m/^h$/) {
   helplist;
 }
 
-if($cmd =~ m/^version$/ || $cmd =~ m/^v$/) {      
+if ($cmd =~ m/^version$/ || $cmd =~ m/^v$/) {
   version;
 }
 
-ldie "only root may use this tool\n" if $< != 0; # getpid() seems to be missing in perlfunc
-helplist "unknown command $cmd\n" if !exists $cmd_table{$cmd};
+ldie "only root may use this tool\n" if $< != 0 && $cmd !~ m/^(cat|view.*|pretty.*)$/; # getpid() seems to be missing in perlfunc
+helplist "unknown command $cmd\n" if (!exists $cmd_table{$cmd} && !$cmd =~ m/view/);
+
+# setup syslogging
+
+if ($cmd !~ m/^(version$|v$|view)/ && -x $logger) {
+  $notify = "(cmd: $cmd)";
+  my $print_id = $Id;
+  $print_id =~ s/\$|Id:| //g;
+  $print_id = substr($print_id, 0, 8);
+  llog "$print_id $host $0 @ARGV\n";
+}
+
+# checks
+
+ldie "The $mars directory does not exist.\n" unless -d $mars;
+
+my @mars_stat = stat($mars) or ldie "Cannot stat '$mars'\n";
+# check uid
+if ($mars_stat[4]) {
+  lwarn "Directory $mars has wrong owner uid $mars_stat[4].\n";
+  chown(0, 0, $mars) or ldie "Cannot chown $mars.\n";
+  lwarn "Fixed by setting to 0.\n";
+}
+# check permissions
+my $perms = ($mars_stat[2] & 07777);
+if ($perms != 0700) {
+  my $txt = sprintf("Directory $mars has wrong permissions 0%o.\n", $perms);
+  lwarn($txt);
+  chmod(0700, $mars) or ldie "Cannot chmod $mars.\n";
+  lwarn "Fixed to mode 0700 for security reasons.\n";
+}
+
+# lowlevel tools
+if ($cmd =~ m/^lowlevel-/) {
+  my $func = $cmd_table{$cmd};
+  if ($func && ref($func) eq "ARRAY") {
+    lwarn "EXPERTS ONLY -- risky lowlevel command '$cmd'\n";
+    my @list = @$func;
+    while (@list) {
+      my $memb_func = shift @list;
+      next unless ref($memb_func) eq "CODE";
+      &{$memb_func}($cmd, @args);
+    }
+    finish_links();
+    exit(0);
+  } else {
+    ldie "Internal error: command table is wrong for '$cmd'";
+  }
+}
+
+if ($cmd !~ m/(create|join)-cluster|create-uuid|cat|view|pretty/) {
+  my $uuid = get_link("$mars/uuid", 1);
+  ldie "No valid cluster UUID $mars/uuid found. You need {create,join}-cluster first (or create-uuid).\n" unless $uuid;
+}
 
 my $res = "";
-unless($cmd =~ m/^(create|leave)-cluster$/) {
+if ($cmd =~ "show") {
+  $res = shift @args || "all";
+} elsif ($cmd =~ m/^(view|pretty)/) {
+  $res = shift @args || "";
+} elsif ($cmd =~ m/^set-.*-list$/) {
+  $res = shift @args || helplist "comma-separated list argument is missing\n";
+} elsif ($cmd =~ m/^set-.*-value$/) {
+  $res = shift @args || helplist "numeric argument is missing\n";
+  ldie "argument '$res' isn't numeric\n" unless $res =~ m/^[0-9.]+$/;
+} elsif (!($cmd =~ m/^(create|leave|wait)-cluster|create-uuid|cat|[a-z]+-file/)) {
   $res = shift @args || helplist "resource argument is missing\n";
   check_id($res);
 }
 
 
-lprint "using FORCE option -- hopefully you know what you do!\n" if $force;
+lwarn "Using FORCE option -- hopefully you know what you are doing!\n" if $force;
 
-sub do_res {
+my %checked_res;
+
+sub do_one_res {
+  my $func = shift;
+  my ($cmd, $res) = @_;
+  if ($cmd =~ m/^cat|-file$|-list$|-link$|-value$/) { # no resource argument
+  } elsif (!$checked_res{"$cmd$res"}) {
+    $res = check_res($res) unless (!$res || $cmd =~ m/^(join|create|leave|wait)-cluster|create-resource|show/);
+    check_res_member($cmd, $res) unless (!$res || $cmd =~ m/^(join|create|delete)-(cluster|resource)|^(leave|wait)-cluster|^log-purge|^show|^view/);
+    detect_splitbrain($res, 1);
+    $checked_res{"$cmd$res"} = 1;
+  }
+  &{$func}(@_);
+}
+
+my %skip_res;
+
+sub do_all_res {
+  my $func = shift;
   my $cmd = shift;
   my $res = shift;
-
-  $res = check_res($res) unless $cmd =~ m/^(join|create|leave)-cluster|create-resource$/;
-  check_res_member($res) unless $cmd =~ m/^(join|create)-(cluster|resource)|leave-cluster$/;
-
-  my $func = $cmd_table{$cmd};
-  &{$func}($cmd, $res, @_);
-}
-
-if($res eq "all") {
-  foreach $res (glob("$mars/resource-*")) {
-    next unless -e "$res/data-$host";
-    $res =~ s/^.*\/resource-(.*)$/$1/;
-    lprint "--------- resource $res\n";
-    do_res($cmd, $res, @args);
+  if ($res eq "all" && $cmd !~ m/show|cat|cluster|set-link|delete-file/) {
+    ldie "Cannot combine command '$cmd' with 'all' existing resources - you must explicitly name a single new resource\n" if $cmd =~ m/create|join/;
+    my $any_success = 0;
+    my $any_member = 0;
+    foreach $res (glob("$mars/resource-*")) {
+      next unless -e "$res/data-$host";
+      $any_member++;
+      $res =~ s/^.*\/resource-(.*)$/$1/;
+      next if defined($skip_res{$res});
+      lprint "--------- resource $res\n" if ($verbose || $cmd !~ m/^log-/);
+      eval {
+	do_one_res($func, $cmd, $res, @_);
+	1;
+      } and $any_success = 1 or $skip_res{$res} = 1;
+    }
+    if (!$any_success) {
+      if (!$any_member) {
+	lprint "I am not member of any resource\n";
+	return 1;
+      }
+      ldie "all resources have errors\n";
+    }
+    return !$any_success;
+  } else {
+    return do_one_res($func, $cmd, $res, @_);
   }
-} else {
-  do_res($cmd, $res, @args);
 }
 
-_trigger();
+if ($cmd =~ m/^(view|pretty)/) {
+  lwarn "mars kernel module is not loaded\n" unless is_module_loaded();
+  do_all_res(\&view_cmd, $cmd, $res, @args);
+  if ($res eq "all" && $cmd =~ m/^view-?(.*)/) {
+    my $global_macro_name = $1 ? "$1-global" : "default-global";
+    my $global_macro = get_macro($global_macro_name, 1);
+    view_cmd($global_macro_name, "", @args) if $global_macro;
+  }
+  finish_links();
+  exit($error_count);
+}
+
+if (!$ip) {
+  $ip = _get_ip() or ldie "cannot determine my IP address\n";
+}
+
+my $func = $cmd_table{$cmd};
+ldie "unknown command '$cmd'\n" unless $func;
+
+if (ref($func) eq "ARRAY") {
+  my @list = @$func;
+  while (@list) {
+    my $memb_func = shift @list;
+    next unless ref($memb_func) eq "CODE";
+    my $headline = shift @list;
+    lprint "---------------------------- $headline:\n" if defined($headline);
+    my $status = do_all_res($memb_func, $cmd, $res, @args);
+    last if (defined($status) && $status);
+    finish_links();
+  }
+} elsif (ref($func) eq "CODE") {
+  do_all_res($func, $cmd, $res, @args);
+} else {
+  ldie "internal error: command table is wrong for '$cmd'";
+}
+
+finish_links();
+
+exit($error_count);

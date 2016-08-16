@@ -1,0 +1,35 @@
+#!/bin/bash
+# v 0.04
+# modify by jms at Mon Feb 17 10:44:28 CET 2014
+# zabbix mars
+
+FINALTEMPFILE="/tmp/zabbix.mars"
+TEMPFILE="${FINALTEMPFILE}.tmp"
+echo -n >$TEMPFILE
+
+
+if [ "`lsmod|grep mars|grep -v grep`" == "" ]; then
+	exit 0
+else
+        # statistic
+        find /proc/sys/mars -name "*" -nowarn -exec echo -n {}" " \; -exec cat {} \; >$TEMPFILE 2>&1
+                         
+        # status 
+	HOSTNAME="`/bin/hostname`"
+	ls -ld /mars/resource-*|awk '{print $9}'|sed -e 's!.*resource-!!g' | \
+	while read RESNAME; do
+		#echo "-> $HOSTNAME - $RESNAME"
+		echo "# actual $RESNAME $HOSTNAME" >>$TEMPFILE
+		ls -ld /mars/resource-$RESNAME/actual-$HOSTNAME/* | sed -e 's!.*/actual-.*/!!g' | awk '{print "status '$RESNAME' " $1 " " $3}' >>$TEMPFILE
+                echo "# todo $RESNAME $HOSTNAME" >>$TEMPFILE
+		ls -ld /mars/resource-$RESNAME/todo-$HOSTNAME/*   | sed -e 's!.*/todo-.*/!!g' | awk '{print "status '$RESNAME' " $1 " " $3}' >>$TEMPFILE
+	done
+	
+	# emergency
+	echo -n "emergency-modus " >>$TEMPFILE
+	ls -l /mars/emergency-$HOSTNAME | awk '{print $11}' >>$TEMPFILE
+
+fi
+
+mv $TEMPFILE $FINALTEMPFILE
+
